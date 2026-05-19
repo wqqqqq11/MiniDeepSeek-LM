@@ -30,8 +30,12 @@ model:
   n_routed_experts: 3           # 路由专家数量
   n_shared_experts: 1           # 共享专家数量
   n_activated_experts: 1        # 每个 token 激活的专家数
-  moe_inter_dim: 48             # 每个路由专家的 FFN 中间层
+  moe_inter_dim: 128            # 每个路由专家的 FFN 中间层
   score_func: "sqrtsoftplus"    # 路由打分函数
+
+  # Aux-Loss-Free 动态偏置配置
+  bias_update_speed: 0.001      # 偏置更新速度（官方固定值）
+  ema_decay: 0.9               # 频率统计滑动平均衰减率
   
   # 序列配置
   max_seq_len: 512            # 阶段1序列长度
@@ -68,9 +72,9 @@ training:
   # 学习率调度（三段式）
   max_lr: 1.0e-4                # 峰值学习率
   min_lr: 3.0e-5                # 最小学习率
-  warmup_steps: 4000            # 预热步数
-  peak_steps: 8000              # 峰值恒定步数
-  cosine_steps: 28920           # 余弦衰减步数
+  warmup_ratio: 0.05            # 预热比例（5%）
+  peak_ratio: 0.50              # 峰值恒定比例（50%）
+  # 余弦衰减比例 = 1 - warmup_ratio - peak_ratio = 45%
   
   # 正则化
   grad_clip: 0.5               # 梯度裁剪范数

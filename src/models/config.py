@@ -74,9 +74,15 @@ class ModelArgs:
     n_limited_groups: int = 2
     """分层路由中每个 token 可选择的组数上限。"""
 
-    score_func: Literal["softmax", "sigmoid"] = "softmax"
-    """MoE 门控的评分函数：'softmax'（归一化）或 'sigmoid'（非归一化）。
-    sigmoid 模式会额外用所选权重之和重新归一化。"""
+    score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
+    """MoE 门控的评分函数：'softmax'、'sigmoid' 或 'sqrtsoftplus'（官方）。"""
+
+    # ── Aux-Loss-Free 动态偏置 ─────────────────────────────────────
+    bias_update_speed: float = 0.001
+    """专家门控偏置更新速度（官方固定值 0.001）。"""
+
+    ema_decay: float = 0.9
+    """专家频率统计滑动平均衰减率。"""
 
     route_scale: float = 1.0
     """路由权重的缩放因子，在专家选择后乘以原始得分，用于控制专家输出大小。"""

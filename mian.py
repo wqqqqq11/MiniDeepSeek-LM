@@ -61,25 +61,36 @@ def train_stage1(config):
 
     # 学习率调度
     sched_cfg = cfg["training"]
+    data_cfg = cfg["data"]
+
+    # 计算实际训练总步数
+    train_dataset = TokenDataset(
+        data_cfg["train_bin"],
+        context_size=data_cfg["context_size"],
+        shuffle_seed=data_cfg["shuffle_seed"],
+    )
+    steps_per_epoch = len(train_dataset) // sched_cfg["batch_size"]
+    total_steps = steps_per_epoch * sched_cfg["num_epochs"]
+
+    # 按比例计算各阶段步数
+    warmup_steps = int(total_steps * sched_cfg["warmup_ratio"])
+    peak_steps = int(total_steps * sched_cfg["peak_ratio"])
+    cosine_steps = total_steps - warmup_steps - peak_steps
+
+    print(f"学习率调度: 总步数={total_steps}, 预热={warmup_steps}, 峰值={peak_steps}, 衰减={cosine_steps}")
+
     scheduler = create_scheduler(
         optimizer,
-        warmup_steps=sched_cfg["warmup_steps"],
-        peak_steps=sched_cfg["peak_steps"],
-        cosine_steps=sched_cfg["cosine_steps"],
+        warmup_steps=warmup_steps,
+        peak_steps=peak_steps,
+        cosine_steps=cosine_steps,
         max_lr=sched_cfg["max_lr"],
         min_lr=sched_cfg["min_lr"],
         mtp_initial_weight=cfg["mtp"]["loss_weight"],
         mtp_final_weight=cfg["mtp"]["loss_weight_decay_end"],
     )
 
-    # 数据
-    data_cfg = cfg["data"]
-    train_dataset = TokenDataset(
-        data_cfg["train_bin"],
-        context_size=data_cfg["context_size"],
-        shuffle_seed=data_cfg["shuffle_seed"],
-    )
-
+    # 数据加载器
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=cfg["training"]["batch_size"],
