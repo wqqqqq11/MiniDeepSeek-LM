@@ -1,9 +1,8 @@
 # =====================================
 # 阶段1：通用基座预训练配置
 # =====================================
-# 模型：5M 参数 Dense Transformer + MLA
+# 模型：5M 参数
 # 数据：650M tokens（中英文 6:4）
-# 训练：2 epochs，batch=32，seq_len=1024
 # =====================================
 
 # 模型参数
@@ -38,7 +37,8 @@ model:
   ema_decay: 0.9               # 频率统计滑动平均衰减率
   
   # 序列配置
-  max_seq_len: 512            # 阶段1序列长度
+  # max_seq_len: 512            # 阶段1序列长度
+  max_seq_len: 1024            # 阶段1序列长度
   original_seq_len: 4096        # RoPE 基准长度
   
   # RoPE 配置
@@ -68,8 +68,10 @@ mtp:
 
 # 训练参数
 training:
-  num_epochs: 5                 # 总训练轮数
-  batch_size: 2                 # 批次大小
+  # num_epochs: 5                 # 总训练轮数
+  num_epochs: 45
+  # batch_size: 2                 # 批次大小
+  batch_size: 32  
   gradient_accumulation: 1      # 梯度累积步数
   
   # 学习率调度（三段式）
@@ -114,7 +116,8 @@ precision:
 data:
   train_bin: "datasets/stage_1_datasets/6_binarize/train.bin"
   val_bin: "datasets/stage_1_datasets/6_binarize/val.bin"
-  context_size: 512
+  # context_size: 512
+  context_size: 1024
   shuffle_seed: 42
 
 # 日志与检查点
