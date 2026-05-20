@@ -194,8 +194,8 @@ class Indexer(nn.Module):
         self.kv_cache: Optional[Tensor] = None
         self.freqs_cis: Optional[Tensor] = None
 
-    def forward(self, x: Tensor, qr: Tensor, start_pos: int) -> Tensor:
-        """检索最相关的压缩 KV 位置。返回 [0, cache_size-1] 范围内的索引。"""
+    def forward(self, x: Tensor, qr: Tensor, start_pos: int, offset: int, device: torch.device) -> Tensor:
+        """检索最相关的压缩 KV 位置。返回加 offset 的索引。"""
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
         end_pos = start_pos + seqlen
@@ -203,48 +203,40 @@ class Indexer(nn.Module):
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_heads, self.latent_dim))
 
-        # 使用低秩 latent 计算检索分数
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-
-        # kv_cache: [B, max_cache_len, latent_dim+rope_dim], 取 latent 部分
         kv_latent = self.kv_cache[:bsz, :end_pos // ratio, :self.latent_dim]
 
-        # 确保 kv_latent 与 q 在同一设备
-        if kv_latent.device != q.device:
-            kv_latent = kv_latent.to(q.device)
+        if kv_latent.device != device:
+            kv_latent = kv_latent.to(device)
 
         index_score = torch.einsum("bshd,btd->bsht", q, kv_latent)
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
         if start_pos == 0:
-            arange = torch.arange(seqlen // ratio, device=index_score.device)
-            mask = arange.repeat(seqlen, 1) >= torch.arange(1, seqlen + 1, device=index_score.device).unsqueeze(1) // ratio
+            arange = torch.arange(seqlen // ratio, device=device)
+            mask = arange.repeat(seqlen, 1) >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
             index_score += torch.where(mask, float("-inf"), 0)
 
         n_available = end_pos // ratio
         if n_available == 0:
-            # 没有压缩位置，返回位置 0 作为回退
-            return torch.zeros(bsz, seqlen, 1, device=x.device, dtype=torch.int64)
+            return torch.zeros(bsz, seqlen, 1, device=device, dtype=torch.int64) + offset
 
         k = min(self.index_topk, n_available)
-        # 使用 .detach() 完全脱离计算图，避免反向传播问题
         topk_idxs = index_score.topk(k, dim=-1)[1].detach()
 
-        # 应用因果 mask（未来位置标记为 -1）
         if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=topk_idxs.device).unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs)
-
-            # 确保每行至少有一个有效索引
-            # 简单方法：将第一列的 -1 替换为 0（无论如何都替换，不影响有效值）
+            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
+            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
             first_col = topk_idxs[:, :, 0]
-            first_col = torch.clamp(first_col, min=0)  # -1 变成 0，其他值不变
+            first_col = torch.clamp(first_col, min=0)
             topk_idxs = torch.cat([first_col.unsqueeze(-1), topk_idxs[:, :, 1:]], dim=-1)
+        else:
+            topk_idxs = topk_idxs + offset
 
         return topk_idxs
 
 
-def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int) -> Tensor:
+def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int, device: torch.device) -> Tensor:
     """生成滑动窗口索引（CSA 局部注意力）。
 
     每个位置只关注最近的 window_size 个 token，实现局部稠密注意力。
@@ -254,8 +246,8 @@ def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int) 
     with torch.no_grad():
         if start_pos == 0:
             # 预填充阶段：返回绝对位置索引
-            base = torch.arange(seqlen, device='cpu').unsqueeze(1)
-            indices = (base - win + 1).clamp(0) + torch.arange(min(seqlen, win), device='cpu')
+            base = torch.arange(seqlen, device=device).unsqueeze(1)
+            indices = (base - win + 1).clamp(0) + torch.arange(min(seqlen, win), device=device)
             indices = torch.where(indices > base, -1, indices)
             return indices.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
 
@@ -263,35 +255,35 @@ def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int) 
         if start_pos >= win - 1:
             start_pos %= win
             indices = torch.cat([
-                torch.arange(start_pos + 1, win, device='cpu'),
-                torch.arange(0, start_pos + 1, device='cpu')
+                torch.arange(start_pos + 1, win, device=device),
+                torch.arange(0, start_pos + 1, device=device)
             ], dim=0)
         else:
-            indices = F.pad(torch.arange(start_pos + 1, device='cpu'),
+            indices = F.pad(torch.arange(start_pos + 1, device=device),
                           (0, win - start_pos - 1), value=-1)
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, seqlen, -1).to(torch.int64)
 
 
-def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int) -> Tensor:
+def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int, device: torch.device) -> Tensor:
     """生成压缩 KV 的固定间隔采样索引（HCA 全局稀疏）。
 
     确保每个位置至少有一个有效索引，避免全 mask 导致 NaN。
     """
-    with torch.no_grad():  # 确保不追踪计算图
+    with torch.no_grad():
         if start_pos > 0:
             n_compress = (start_pos + 1) // compress_ratio
             if n_compress == 0:
-                indices = torch.zeros(1, device='cpu', dtype=torch.int64)
+                indices = torch.zeros(1, device=device, dtype=torch.int64)
             else:
-                indices = torch.arange(0, n_compress, device='cpu') + offset
+                indices = torch.arange(0, n_compress, device=device) + offset
         else:
             n_available = seqlen // compress_ratio
             if n_available == 0:
-                indices = torch.zeros(seqlen, 1, device='cpu', dtype=torch.int64)
+                indices = torch.zeros(seqlen, 1, device=device, dtype=torch.int64)
             else:
-                base = torch.arange(seqlen, device='cpu').unsqueeze(1)
-                indices = torch.arange(n_available, device='cpu').repeat(seqlen, 1)
-                mask = indices >= torch.arange(1, seqlen + 1, device='cpu').unsqueeze(1) // compress_ratio
+                base = torch.arange(seqlen, device=device).unsqueeze(1)
+                indices = torch.arange(n_available, device=device).repeat(seqlen, 1)
+                mask = indices >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // compress_ratio
                 indices = torch.where(mask, -1, indices + offset)
                 all_masked = mask.all(dim=1)
                 if all_masked.any():
@@ -320,20 +312,14 @@ class MLAStage1(nn.Module):
 
     def _init_kv_proj(self, args: ModelArgs):
         """初始化 KV 投影层。"""
-        self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank + self.rope_head_dim, bias=False)
-        self.kv_norm = RMSNorm(self.kv_lora_rank, args.norm_eps)
-        self.wkv_b = nn.Linear(
-            self.kv_lora_rank,
-            self.n_heads * (self.nope_head_dim + self.v_head_dim),
-            bias=False
-        )
+        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
+        self.kv_norm = RMSNorm(self.head_dim, args.norm_eps)
 
     def _init_caches(self, args: ModelArgs):
         """初始化 KV 缓存：所有层都有窗口缓存，按需分配压缩缓存。"""
-        cache_dim = self.kv_lora_rank + self.rope_head_dim
         self.register_buffer(
-            "kv_window_cache",
-            torch.zeros(args.max_batch_size, self.window_size, cache_dim),
+            "kv_cache",
+            torch.zeros(args.max_batch_size, self.window_size, self.head_dim),
             persistent=False
         )
 
@@ -341,10 +327,10 @@ class MLAStage1(nn.Module):
             max_cache_len = args.max_seq_len // self.compress_ratio
             self.register_buffer(
                 "kv_compress_cache",
-                torch.zeros(args.max_batch_size, max_cache_len, cache_dim),
+                torch.zeros(args.max_batch_size, max_cache_len, self.head_dim),
                 persistent=False
             )
-            self.compressor = Compressor(args, self.compress_ratio, cache_dim)
+            self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
 
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
@@ -411,53 +397,59 @@ class MLAStage1(nn.Module):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         win = self.window_size
+        rd = self.rope_head_dim
 
         freqs_cis = self.freqs_cis[start_pos:end_pos]
 
         # Query 投影
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
-            qr = x
-        else:
-            qr = self.q_norm(self.wq_a(x))
-            q = self.wq_b(qr)
-
+        qr = q = self.q_norm(self.wq_a(x)) if self.q_lora_rank > 0 else x
+        if self.q_lora_rank > 0:
+            q = self.wq_b(q)
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
 
-        if freqs_cis.device != q.device:
-            freqs_cis = freqs_cis.to(q.device)
-
-        q = torch.cat([q[..., :-self.rope_head_dim], apply_rotary_emb(q[..., -self.rope_head_dim:], freqs_cis)], dim=-1)
-
-        # KV 投影与窗口缓存更新
-        kv = self.wkv_a(x)
-        kv_latent, k_pe = torch.split(kv, [self.kv_lora_rank, self.rope_head_dim], dim=-1)
-        kv_latent = self.kv_norm(kv_latent)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
-        kv_full = torch.cat([kv_latent, k_pe], dim=-1)
-        self._update_window_cache(kv_full, start_pos, bsz, seqlen)
+        # KV 投影
+        kv = self.wkv(x)
+        kv = self.kv_norm(kv)
+        apply_rotary_emb(kv[..., -rd:], freqs_cis)
 
         # 更新压缩缓存
-        if self.compressor is not None:
+        if self.compressor is not None and self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_compress_cache
-            self.compressor(x, start_pos)
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
 
-        # 生成索引（窗口 + 可选压缩）
-        topk_idxs = self._get_sparse_indices(x, qr, start_pos, seqlen, bsz, win)
-
-        # 收集窗口 KV
-        kv_window = self._gather_kv(self.kv_window_cache[:bsz], topk_idxs[:, :, :win])
-
-        # 收集压缩 KV（如果有）
+        # 生成索引（直接在 GPU）
+        device = x.device
+        topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, device)
         if self.compress_ratio > 0:
-            kv_compress = self._gather_kv(self.kv_compress_cache[:bsz], topk_idxs[:, :, win:])
-            sparse_kv = torch.cat([kv_window, kv_compress], dim=2)
-        else:
-            sparse_kv = kv_window
+            offset = kv.size(1) if start_pos == 0 else win
+            if self.indexer is not None:
+                compress_idxs = self.indexer(x, qr, start_pos, offset, device)
+            else:
+                compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, offset, device)
+            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+        topk_idxs = topk_idxs.long()
 
-        # 计算注意力
-        o = self._compute_sparse_attention(q, sparse_kv, topk_idxs)
+        # 缓存更新与注意力计算
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            if self.compress_ratio > 0:
+                kv_compress = self.compressor(x, start_pos)
+                if kv_compress is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
+            o = self._sparse_attn(q, kv, topk_idxs)
+        else:
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if self.compress_ratio > 0:
+                self.compressor(x, start_pos)
+            o = self._sparse_attn(q, self.kv_cache[:bsz], topk_idxs)
 
         return self.wo(o.flatten(2))
 
@@ -465,88 +457,52 @@ class MLAStage1(nn.Module):
         """应用 Attention Sink 偏差到注意力分数。[b,s,h,k] + [1,1,h,1]"""
         return scores + self.attn_sink.view(1, 1, -1, 1)
 
-    def _update_window_cache(self, kv_full: Tensor, start_pos: int, bsz: int, seqlen: int):
-        """更新 CSA 窗口缓存。"""
-        win = self.window_size
-        with torch.no_grad():  # 避免计算图问题
-            if start_pos == 0:
-                if seqlen <= win:
-                    self.kv_window_cache[:bsz, :seqlen] = kv_full
-                else:
-                    cutoff = seqlen % win
-                    self.kv_window_cache[:bsz, cutoff:win], self.kv_window_cache[:bsz, :cutoff] = \
-                        kv_full[:, -win:].split([win - cutoff, cutoff], dim=1)
-            else:
-                self.kv_window_cache[:bsz, start_pos % win] = kv_full.squeeze(1)
-
-    def _get_sparse_indices(self, x: Tensor, qr: Tensor, start_pos: int, seqlen: int, bsz: int, win: int) -> Tensor:
-        """生成稀疏索引：窗口 + 可选压缩。"""
-        window_idxs = get_window_indices(win, bsz, seqlen, start_pos)
-
-        if start_pos == 0:
-            valid_mask = window_idxs >= 0
-            window_idxs = torch.where(valid_mask, window_idxs % win, window_idxs)
-
-        device = x.device
-        if window_idxs.device != device:
-            window_idxs = window_idxs.to(device)
-
-        if self.compress_ratio == 0:
-            return window_idxs
-
-        if self.indexer is not None:
-            compress_idxs = self.indexer(x, qr, start_pos)
-        else:
-            compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, 0)
-
-        if compress_idxs.device != device:
-            compress_idxs = compress_idxs.to(device)
-
-        return torch.cat([window_idxs, compress_idxs], dim=-1)
-
-    def _compute_sparse_attention(self, q: Tensor, sparse_kv: Tensor, indices: Tensor) -> Tensor:
+    def _sparse_attn(self, q: Tensor, kv: Tensor, indices: Tensor) -> Tensor:
         """计算稀疏注意力。"""
-        wkv_b = self.wkv_b.weight.view(self.n_local_heads, -1, self.kv_lora_rank)
-        k_nope_sparse = torch.einsum("bskc,hdc->bskhd", sparse_kv[..., :self.kv_lora_rank], wkv_b[:, :self.nope_head_dim])
-        v_sparse = torch.einsum("bskc,hdc->bskhd", sparse_kv[..., :self.kv_lora_rank], wkv_b[:, -self.v_head_dim:])
+        bsz, seqlen, k = indices.size()
+        rd = self.rope_head_dim
 
-        k_pe_sparse = sparse_kv[..., self.kv_lora_rank:].unsqueeze(3).expand(-1, -1, -1, self.n_local_heads, -1)
-        k_sparse = torch.cat([k_nope_sparse, k_pe_sparse], dim=-1).transpose(2, 3)
-        v_sparse = v_sparse.transpose(2, 3)
+        # 收集稀疏 KV
+        safe_indices = indices.clamp(min=0)
+        sparse_kv = kv.gather(1, safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim))
+        sparse_kv = sparse_kv.view(bsz, seqlen, k, self.head_dim)
 
-        scores = torch.einsum("bshd,bshkd->bshk", q, k_sparse) * self.softmax_scale
+        # 分割 K 和 V: kv 格式为 [nope + rope] 或 [nope + rope + v]
+        # K 使用 nope + rope 部分，V 使用 v_head_dim 部分
+        kv_nope_rope = self.nope_head_dim + rd
+        k_sparse = sparse_kv[..., :kv_nope_rope]
+        v_sparse = sparse_kv[..., :self.v_head_dim]
+
+        # 扩展维度以匹配注意力计算 [b,s,1,k,d] -> [b,s,h,k,d]
+        k_sparse = k_sparse.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1, -1)
+        v_sparse = v_sparse.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1, -1)
+
+        # 分离 nope 和 rope 部分
+        k_nope, k_pe = torch.split(k_sparse, [self.nope_head_dim, rd], dim=-1)
+        q_nope, q_pe = torch.split(q, [self.nope_head_dim, rd], dim=-1)
+
+        # 扩展 q 维度以匹配 k: [b,s,h,d] -> [b,s,h,1,d]
+        q_nope = q_nope.unsqueeze(3)
+        q_pe = q_pe.unsqueeze(3)
+
+        # 计算注意力分数
+        scores = torch.einsum("bshkd,bshkd->bshk", q_nope, k_nope) + \
+                 torch.einsum("bshkd,bshkd->bshk", q_pe, k_pe)
+        scores = scores * self.softmax_scale
         scores = self._apply_attn_sink(scores)
 
-        if indices.device != scores.device:
-            indices = indices.to(scores.device)
-
+        # mask
         mask = indices < 0
         scores += torch.where(mask.unsqueeze(2), float("-inf"), 0)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
-        return torch.einsum("bshk,bshkd->bshd", scores, v_sparse)
-
-    def _gather_kv(self, kv_cache: Tensor, indices: Tensor) -> Tensor:
-        """根据索引从 KV 缓存中收集稀疏 KV。"""
-        bsz, seqlen, k = indices.size()
-        head_dim = kv_cache.size(-1)
-
-        # 确保索引与缓存设备一致
-        if indices.device != kv_cache.device:
-            indices = indices.to(kv_cache.device)
-
-        safe_indices = indices.clamp(min=0)
-        kv = kv_cache.gather(1, safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, head_dim))
-        kv = kv.view(bsz, seqlen, k, head_dim)
-
-        mask = (indices < 0).unsqueeze(-1)
-        kv = torch.where(mask, torch.zeros_like(kv), kv)
-
-        return kv
+        # 聚合
+        o = torch.einsum("bshk,bshkd->bshd", scores, v_sparse)
+        return o
 
     def get_kv_cache_size(self) -> int:
         """获取 KV 缓存大小（以元素计）。"""
-        total = self.kv_window_cache.numel()
+        total = self.kv_cache.numel()
         if self.kv_compress_cache is not None:
             total += self.kv_compress_cache.numel()
         return total
