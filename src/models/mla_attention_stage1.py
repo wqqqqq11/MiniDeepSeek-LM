@@ -408,12 +408,21 @@ class MLAStage1(nn.Module):
         self._init_caches(args)
         self._init_rope(args)
 
+        self._init_attn_sink()
+
+    def _init_attn_sink(self):
+        """初始化 Attention Sink - 稳定长序列注意力的可学习偏差。"""
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads))
+
     def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
         """前向传播，根据 mode 选择 HCA 或 CSA 路径。"""
         if self.mode == 0:
             return self._forward_hca(x, start_pos)
-        else:
-            return self._forward_csa(x, start_pos)
+        return self._forward_csa(x, start_pos)
+
+    def _apply_attn_sink(self, scores: Tensor) -> Tensor:
+        """应用 Attention Sink 偏差到注意力分数。[b,s,h,k] + [1,1,h,1]"""
+        return scores + self.attn_sink.view(1, 1, -1, 1)
 
     def _forward_hca(self, x: Tensor, start_pos: int) -> Tensor:
         """纯 HCA 模式：只使用全局压缩 KV。"""
@@ -467,8 +476,8 @@ class MLAStage1(nn.Module):
 
         # 稀疏注意力
         scores = torch.einsum("bshd,bshkd->bshk", q, k_sparse) * self.softmax_scale
+        scores = self._apply_attn_sink(scores)
 
-        # 确保 mask 与 scores 在同一设备
         if compress_idxs.device != scores.device:
             compress_idxs = compress_idxs.to(scores.device)
 
@@ -526,14 +535,13 @@ class MLAStage1(nn.Module):
         v_sparse = v_sparse.transpose(2, 3)
 
         scores = torch.einsum("bshd,bshkd->bshk", q, k_sparse) * self.softmax_scale
+        scores = self._apply_attn_sink(scores)
 
-        # 确保 mask 与 scores 在同一设备
         if indices.device != scores.device:
             indices = indices.to(scores.device)
 
         mask = indices < 0
         scores += torch.where(mask.unsqueeze(2), float("-inf"), 0)
-
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
         return torch.einsum("bshk,bshkd->bshd", scores, v_sparse)
