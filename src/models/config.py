@@ -225,7 +225,9 @@ class ModelArgs:
             rope_factor=1.0,
             attn_patterns=(0, 1, 0, 1, 0, 1, 0, 1),  # 交替 HCA/CSA
             compress_ratios=(128, 4, 128, 4, 128, 4, 128, 4),  # HCA=128, CSA=4
-            hc_mult=1,  # 不使用 Hyper-Connections
+            hc_mult=2,  # Hyper-Connections 倍数
+            hc_sinkhorn_iters=5,  # Sinkhorn 迭代次数
+            hc_eps=1e-6,  # HC 数值稳定常数
             score_func="sqrtsoftplus",  # 路由打分函数
             route_scale=1.0,  # 路由权重缩放
         )

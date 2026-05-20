@@ -121,63 +121,55 @@ def rotate_activation(x: torch.Tensor, scale: float | None = None) -> torch.Tens
         return (x_rotated * scale).to(x.dtype)
 
 
+def _apply_scale(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """应用缩放和偏置，分割为 pre/post/comb 三部分。"""
+    # 构建 scale 重复张量: [pre_scale]*hc_mult + [post_scale]*hc_mult + [comb_scale]*hc_mult^2
+    scale_parts = [
+        hc_scale[0].expand(hc_mult),
+        hc_scale[1].expand(hc_mult),
+        hc_scale[2].expand(hc_mult * hc_mult),
+    ]
+    scale_repeated = torch.cat(scale_parts).unsqueeze(0).unsqueeze(0)
+
+    mixes = mixes * scale_repeated + hc_base
+
+    pre = mixes[..., :hc_mult]
+    post = mixes[..., hc_mult:2 * hc_mult]
+    comb = mixes[..., 2 * hc_mult:].view(mixes.size(0), mixes.size(1), hc_mult, hc_mult)
+
+    return pre, post, comb
+
+
+def _sinkhorn_normalize(matrix: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
+    """Sinkhorn 迭代归一化，将矩阵变为双随机矩阵。"""
+    # 先确保非负，使用 exp 转换
+    matrix = torch.exp(matrix)
+
+    for _ in range(iters):
+        # 行归一化
+        matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + eps)
+        # 列归一化
+        matrix = matrix / (matrix.sum(dim=-2, keepdim=True) + eps)
+    return matrix
+
+
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
     hc_mult: int,
-    sinkhorn_iters: int = 20,
+    sinkhorn_iters: int = 5,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Hyper-Connections 的 Sinkhorn 正则化分块（模拟实现）。
+    """Hyper-Connections 的 Sinkhorn 正则化分块。"""
+    pre, post, comb = _apply_scale(mixes, hc_scale, hc_base, hc_mult)
 
-    Sinkhorn 算法将输入分布正则化为双随机矩阵，用于学习残差流的混合权重。
-    这是流形超连接的核心计算步骤。
+    # Pre/post 用 softmax 归一化
+    pre_weights = torch.softmax(pre, dim=-1)
+    post_weights = torch.softmax(post, dim=-1)
 
-    Args:
-        mixes: 混合分数 [batch, seq, mix_hc]
-        hc_scale: 缩放参数 [3]，控制 pre/post/comb 三部分的分布
-        hc_base: 偏置参数 [mix_hc]
-        hc_mult: Hyper-Connections 倍数
-        sinkhorn_iters: Sinkhorn 迭代次数
-        eps: 数值稳定常数
-
-    Returns:
-        (pre_weights, post_weights, comb_matrix)
-        - pre_weights: [batch, seq, hc_mult]，用于 pre 混合
-        - post_weights: [batch, seq, hc_mult]，用于 post 混合
-        - comb_matrix: [batch, seq, hc_mult, hc_mult]，组合矩阵
-    """
-    b, s, mix_hc = mixes.shape
-
-    # 应用可学习的缩放和偏置
-    # hc_scale 控制三部分的分布: [pre_scale, post_scale, comb_scale]
-    # 这里简化处理，直接使用 sigmoid 归一化
-    mixes = mixes * hc_scale[0] + hc_base  # 简化：只用第一个 scale
-
-    # 分割为 pre, post, comb 三部分
-    # mix_hc = (2 + hc_mult) * hc_mult = pre_size + post_size + comb_size
-    pre_size = hc_mult
-    post_size = hc_mult
-    comb_size = hc_mult * hc_mult
-
-    pre = mixes[..., :pre_size]
-    post = mixes[..., pre_size:pre_size + post_size]
-    comb = mixes[..., pre_size + post_size:]
-
-    # Softmax 归一化（模拟 Sinkhorn 效果）
-    pre_weights = torch.sigmoid(pre) + eps
-    pre_weights = pre_weights / pre_weights.sum(dim=-1, keepdim=True)
-
-    post_weights = torch.sigmoid(post) + eps
-    post_weights = post_weights / post_weights.sum(dim=-1, keepdim=True)
-
-    # Comb 矩阵 reshape 并归一化
-    comb_matrix = comb.view(b, s, hc_mult, hc_mult)
-    comb_matrix = torch.sigmoid(comb_matrix) + eps
-    # 行归一化
-    comb_matrix = comb_matrix / comb_matrix.sum(dim=-1, keepdim=True)
+    # Comb 用 Sinkhorn 迭代归一化为双随机矩阵
+    comb_matrix = _sinkhorn_normalize(comb, sinkhorn_iters, eps)
 
     return pre_weights, post_weights, comb_matrix
 
