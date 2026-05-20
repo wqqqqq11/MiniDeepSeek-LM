@@ -449,6 +449,7 @@ class MLAStage1(nn.Module):
         kv = self.wkv_a(x)
         kv_latent, k_pe = torch.split(kv, [self.kv_lora_rank, self.rope_head_dim], dim=-1)
         kv_latent = self.kv_norm(kv_latent)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
 
         # 更新压缩缓存
         if self.compressor is not None and self.kv_compress_cache is not None:
@@ -572,6 +573,7 @@ class MLAStage1(nn.Module):
         kv = self.wkv_a(x)
         kv_latent, k_pe = torch.split(kv, [self.kv_lora_rank, self.rope_head_dim], dim=-1)
         kv_latent = self.kv_norm(kv_latent)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1)
         self._update_window_cache(kv_full, start_pos, bsz, seqlen)
 
