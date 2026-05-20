@@ -244,32 +244,29 @@ class Indexer(nn.Module):
 def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int) -> Tensor:
     """生成滑动窗口索引（CSA 局部注意力）。
 
-    返回环形缓冲区索引 [0, window_size-1]，适配环形缓存设计。
+    每个位置只关注最近的 window_size 个 token，实现局部稠密注意力。
     """
     win = window_size
 
-    with torch.no_grad():  # 确保不追踪计算图
+    with torch.no_grad():
         if start_pos == 0:
-            # 预填充阶段：模拟环形缓冲区，返回相对位置
-            positions = torch.arange(seqlen, device='cpu')
-            base = positions.unsqueeze(1)  # [seqlen, 1]
-            offsets = torch.arange(win, device='cpu')  # [win]
-            abs_positions = base - win + 1 + offsets  # [seqlen, win]
-            valid_mask = abs_positions >= 0
-            indices = torch.where(valid_mask, abs_positions % win, torch.tensor(-1, device='cpu'))
-            return indices.unsqueeze(0).expand(bsz, -1, -1).to(torch.int64)
+            # 预填充阶段：返回绝对位置索引
+            base = torch.arange(seqlen, device='cpu').unsqueeze(1)
+            indices = (base - win + 1).clamp(0) + torch.arange(min(seqlen, win), device='cpu')
+            indices = torch.where(indices > base, -1, indices)
+            return indices.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
+
+        # 解码阶段
+        if start_pos >= win - 1:
+            start_pos %= win
+            indices = torch.cat([
+                torch.arange(start_pos + 1, win, device='cpu'),
+                torch.arange(0, start_pos + 1, device='cpu')
+            ], dim=0)
         else:
-            # 解码阶段
-            curr_idx = start_pos % win
-            if start_pos >= win - 1:
-                indices = torch.cat([
-                    torch.arange(curr_idx + 1, win, device='cpu'),
-                    torch.arange(0, curr_idx + 1, device='cpu')
-                ], dim=0)
-            else:
-                indices = F.pad(torch.arange(0, curr_idx + 1, device='cpu'),
-                              (win - curr_idx - 1, 0), value=-1)
-            return indices.unsqueeze(0).unsqueeze(0).expand(bsz, 1, -1).to(torch.int64)
+            indices = F.pad(torch.arange(start_pos + 1, device='cpu'),
+                          (0, win - start_pos - 1), value=-1)
+        return indices.unsqueeze(0).unsqueeze(0).expand(bsz, seqlen, -1).to(torch.int64)
 
 
 def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int) -> Tensor:
@@ -507,14 +504,16 @@ class MLAStage1(nn.Module):
         win = self.window_size
         window_idxs = get_window_indices(win, bsz, seqlen, start_pos)
 
+        # 预填充阶段：将绝对位置索引映射到环形缓冲区位置，保留无效标记
+        if start_pos == 0:
+            valid_mask = window_idxs >= 0
+            window_idxs = torch.where(valid_mask, window_idxs % win, window_idxs)
+
         if self.indexer is not None:
-            # Indexer 返回 [0, cache_size-1] 范围内的索引（不再加 offset）
             compress_idxs = self.indexer(x, qr, start_pos)
         else:
-            # 不使用 offset，让索引保持在 [0, cache_size-1]
             compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, 0)
 
-        # 确保两个索引张量在同一设备
         device = x.device
         if window_idxs.device != device:
             window_idxs = window_idxs.to(device)
