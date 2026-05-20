@@ -150,11 +150,16 @@ class ModelArgs:
     """CSA 滑动窗口大小。局部注意力只关注最近 window_size 个 token。
     这是 DeepSeek-V4 处理短距离依赖的核心机制。"""
 
+    attn_patterns: tuple = ()
+    """每层注意力模式元组，长度应等于 n_layers。
+    0 = HCA (纯全局压缩), 1 = CSA (局部窗口 + 轻量压缩)。
+    示例: (0, 1, 0, 1, 0, 1, 0, 1) 表示交替 HCA/CSA。"""
+
     compress_ratios: tuple = ()
     """每层 HCA 的压缩比率元组，长度应等于 n_layers。
     0 表示该层不使用 HCA 压缩，仅使用 CSA 滑动窗口。
     4 或 128 表示每 N 个 token 压缩为 1 个，用于长距离依赖。
-    示例: (0, 0, 4, 128, 4, 128, 4, 0) 表示交替使用不同压缩强度。"""
+    示例: (128, 4, 128, 4, 128, 4, 128, 4) 表示 HCA=128, CSA=4。"""
 
     index_topk: int = 512
     """HCA 全局检索的 top-k 数量。
@@ -218,7 +223,8 @@ class ModelArgs:
             original_seq_len=4096,
             rope_theta=10000.0,
             rope_factor=1.0,
-            compress_ratios=tuple([0] * 8),  # 不使用 HCA
+            attn_patterns=(0, 1, 0, 1, 0, 1, 0, 1),  # 交替 HCA/CSA
+            compress_ratios=(128, 4, 128, 4, 128, 4, 128, 4),  # HCA=128, CSA=4
             hc_mult=1,  # 不使用 Hyper-Connections
             score_func="sqrtsoftplus",  # 路由打分函数
             route_scale=1.0,  # 路由权重缩放

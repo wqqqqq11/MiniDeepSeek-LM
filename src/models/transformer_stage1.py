@@ -35,7 +35,7 @@ class BlockStage1(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
-        self.attn = MLAStage1(args)
+        self.attn = MLAStage1(layer_id, args)
         self.mlp_norm = RMSNorm(args.dim, args.norm_eps)
         self.mlp = MoE(layer_id, args)
 

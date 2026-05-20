@@ -46,3 +46,14 @@
    causal LM loss
 
 
+## 架构层面未实现
+CSA 压缩稀疏注意力 ❌  只有简化版MLA，无压缩稀疏注意力
+HCA 重度压缩稠密注意力  ❌    未实现全局压缩KV检索
+滑动窗口注意力 (SWA) ❌ window_size 配置未实际使用
+Attention Sink    ❌    长上下文稳定性机制未实现
+流形约束超连接 (mHC)    ❌    hc_mult=1，无多残差流
+DeepGEMM 融合算子    ❌    使用标准PyTorch，无自定义CUDA核（不需要实现）
+FP8 × FP4 混合精度   ❌    当前使用bf16（不需要实现）
+Muon 二阶优化器   ❌    使用AdamW，Muon未实现
+
+
