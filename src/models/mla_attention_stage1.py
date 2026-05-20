@@ -438,10 +438,8 @@ class MLAStage1(nn.Module):
             q = self.wq_b(self.q_norm(self.wq_a(x)))
 
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
-        q = (q / (q_norm + 1e-6) * (self.head_dim ** 0.5)).to(q.dtype)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
 
-        # 确保 freqs_cis 与 q 在同一设备
         if freqs_cis.device != q.device:
             freqs_cis = freqs_cis.to(q.device)
 
@@ -563,10 +561,8 @@ class MLAStage1(nn.Module):
             q = self.wq_b(qr)
 
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        q_norm = q.to(torch.float32).norm(dim=-1, keepdim=True)
-        q = (q / (q_norm + 1e-6) * (self.head_dim ** 0.5)).to(q.dtype)
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
 
-        # 确保 freqs_cis 与 q 在同一设备
         if freqs_cis.device != q.device:
             freqs_cis = freqs_cis.to(q.device)
 
