@@ -3,7 +3,7 @@ MLA (Multi-Head Latent Attention) - 阶段1实现
 
 支持稀疏注意力机制：
 - 所有层都有滑动窗口注意力 (window_size)
-- 按层配置压缩比率 (compress_ratios): 
+- 按层配置压缩比率 (compress_ratios):
   * 高压缩层 (128): 窗口 + 重度压缩检索
   * 低压缩层 (4): 窗口 + 轻量压缩检索
   * 无压缩层 (0): 纯窗口注意力
@@ -137,8 +137,6 @@ class Compressor(nn.Module):
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
 
-        x = x.float()
-
         if start_pos == 0:
             kv, should_compress, cutoff = self._compress_prefill(x, seqlen, bsz)
         else:
@@ -155,13 +153,11 @@ class Compressor(nn.Module):
         else:
             freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
 
-        # 确保 freqs_cis 与 kv 在同一设备
         if freqs_cis.device != kv.device:
             freqs_cis = freqs_cis.to(kv.device)
 
         kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], dim=-1)
 
-        # 使用 no_grad 避免计算图问题
         with torch.no_grad():
             if start_pos == 0:
                 self.kv_cache[:bsz, :seqlen // self.compress_ratio, :kv.size(-1)].copy_(kv)
@@ -178,19 +174,17 @@ class Indexer(nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.index_n_heads
-        self.latent_dim = args.kv_lora_rank  # 使用低秩维度而非 head_dim
+        self.latent_dim = args.kv_lora_rank
         self.rope_head_dim = args.qk_rope_head_dim
         self.index_topk = args.index_topk
         self.compress_ratio = compress_ratio
         self.q_lora_rank = args.q_lora_rank
 
-        # Query 投影到低秩维度进行检索
         q_input_dim = self.q_lora_rank if self.q_lora_rank > 0 else self.dim
         self.wq_b = nn.Linear(q_input_dim, self.n_heads * self.latent_dim, bias=False)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.latent_dim ** -0.5
 
-        # 引用外部缓存（由 MLAStage1 设置）
         self.kv_cache: Optional[Tensor] = None
         self.freqs_cis: Optional[Tensor] = None
 
@@ -200,58 +194,54 @@ class Indexer(nn.Module):
         ratio = self.compress_ratio
         end_pos = start_pos + seqlen
 
-        q = self.wq_b(qr)
-        q = q.unflatten(-1, (self.n_heads, self.latent_dim))
+        with torch.no_grad():
+            q = self.wq_b(qr)
+            q = q.unflatten(-1, (self.n_heads, self.latent_dim))
 
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
-        kv_latent = self.kv_cache[:bsz, :end_pos // ratio, :self.latent_dim]
+            weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+            kv_latent = self.kv_cache[:bsz, :end_pos // ratio, :self.latent_dim]
 
-        if kv_latent.device != device:
-            kv_latent = kv_latent.to(device)
+            if kv_latent.device != device:
+                kv_latent = kv_latent.to(device)
 
-        index_score = torch.einsum("bshd,btd->bsht", q, kv_latent)
-        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+            index_score = torch.einsum("bshd,btd->bsht", q, kv_latent)
+            index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
-        if start_pos == 0:
-            arange = torch.arange(seqlen // ratio, device=device)
-            mask = arange.repeat(seqlen, 1) >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
-            index_score += torch.where(mask, float("-inf"), 0)
+            if start_pos == 0:
+                arange = torch.arange(seqlen // ratio, device=device)
+                mask = arange.repeat(seqlen, 1) >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
+                index_score += torch.where(mask, float("-inf"), 0)
 
-        n_available = end_pos // ratio
-        if n_available == 0:
-            return torch.zeros(bsz, seqlen, 1, device=device, dtype=torch.int64) + offset
+            n_available = end_pos // ratio
+            if n_available == 0:
+                return torch.zeros(bsz, seqlen, 1, device=device, dtype=torch.int64) + offset
 
-        k = min(self.index_topk, n_available)
-        topk_idxs = index_score.topk(k, dim=-1)[1].detach()
+            k = min(self.index_topk, n_available)
+            topk_idxs = index_score.topk(k, dim=-1)[1]
 
-        if start_pos == 0:
-            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
-            topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-            first_col = topk_idxs[:, :, 0]
-            first_col = torch.clamp(first_col, min=0)
-            topk_idxs = torch.cat([first_col.unsqueeze(-1), topk_idxs[:, :, 1:]], dim=-1)
-        else:
-            topk_idxs = topk_idxs + offset
+            if start_pos == 0:
+                mask = topk_idxs >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
+                topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+                first_col = topk_idxs[:, :, 0]
+                first_col = torch.clamp(first_col, min=0)
+                topk_idxs = torch.cat([first_col.unsqueeze(-1), topk_idxs[:, :, 1:]], dim=-1)
+            else:
+                topk_idxs = topk_idxs + offset
 
-        return topk_idxs
+            return topk_idxs
 
 
 def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int, device: torch.device) -> Tensor:
-    """生成滑动窗口索引（CSA 局部注意力）。
-
-    每个位置只关注最近的 window_size 个 token，实现局部稠密注意力。
-    """
+    """生成滑动窗口索引（CSA 局部注意力）。"""
     win = window_size
 
     with torch.no_grad():
         if start_pos == 0:
-            # 预填充阶段：返回绝对位置索引
             base = torch.arange(seqlen, device=device).unsqueeze(1)
             indices = (base - win + 1).clamp(0) + torch.arange(min(seqlen, win), device=device)
             indices = torch.where(indices > base, -1, indices)
             return indices.unsqueeze(0).expand(bsz, -1, -1).to(torch.int32)
 
-        # 解码阶段
         if start_pos >= win - 1:
             start_pos %= win
             indices = torch.cat([
@@ -264,11 +254,9 @@ def get_window_indices(window_size: int, bsz: int, seqlen: int, start_pos: int, 
         return indices.unsqueeze(0).unsqueeze(0).expand(bsz, seqlen, -1).to(torch.int64)
 
 
-def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int, device: torch.device) -> Tensor:
-    """生成压缩 KV 的固定间隔采样索引（HCA 全局稀疏）。
-
-    确保每个位置至少有一个有效索引，避免全 mask 导致 NaN。
-    """
+def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: int,
+                         offset: int, device: torch.device) -> Tensor:
+    """生成压缩 KV 的固定间隔采样索引（HCA 全局稀疏）。"""
     with torch.no_grad():
         if start_pos > 0:
             n_compress = (start_pos + 1) // compress_ratio
@@ -293,13 +281,34 @@ def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: 
 
 
 class MLAStage1(nn.Module):
-    """
-    阶段1 MLA 实现，支持交替 CSA/HCA 模式。
+    """阶段1 MLA 实现，支持交替 CSA/HCA 模式。"""
 
-    Args:
-        layer_id: 层索引，用于确定注意力模式。
-        args: 模型配置参数。
-    """
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.layer_id = layer_id
+        self.dim = args.dim
+        self.n_heads = args.n_heads
+        self.n_local_heads = args.n_heads
+
+        self.q_lora_rank = args.q_lora_rank
+        self.kv_lora_rank = args.kv_lora_rank
+        self.head_dim = args.head_dim
+        self.rope_head_dim = args.qk_rope_head_dim
+        self.nope_head_dim = args.qk_nope_head_dim
+        self.v_head_dim = args.v_head_dim
+
+        compress_ratios: List[int] = list(getattr(args, 'compress_ratios', [0] * args.n_layers))
+        self.compress_ratio = compress_ratios[layer_id] if layer_id < len(compress_ratios) else 0
+
+        self.window_size = args.window_size
+        self.softmax_scale = self.head_dim ** -0.5
+
+        self._init_query_proj(args)
+        self._init_kv_proj(args)
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
+        self._init_caches(args)
+        self._init_rope(args)
+        self._init_attn_sink()
 
     def _init_query_proj(self, args: ModelArgs):
         """初始化 Query 投影层。"""
@@ -360,34 +369,6 @@ class MLAStage1(nn.Module):
         if self.indexer is not None:
             self.indexer.freqs_cis = self.freqs_cis
 
-    def __init__(self, layer_id: int, args: ModelArgs):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = args.dim
-        self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads
-
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.head_dim = args.head_dim
-        self.rope_head_dim = args.qk_rope_head_dim
-        self.nope_head_dim = args.qk_nope_head_dim
-        self.v_head_dim = args.v_head_dim
-
-        compress_ratios: List[int] = list(getattr(args, 'compress_ratios', [0] * args.n_layers))
-        self.compress_ratio = compress_ratios[layer_id] if layer_id < len(compress_ratios) else 0
-
-        self.window_size = args.window_size
-        self.softmax_scale = self.head_dim ** -0.5
-
-        self._init_query_proj(args)
-        self._init_kv_proj(args)
-        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
-        self._init_caches(args)
-        self._init_rope(args)
-
-        self._init_attn_sink()
-
     def _init_attn_sink(self):
         """初始化 Attention Sink - 稳定长序列注意力的可学习偏差。"""
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
@@ -407,12 +388,16 @@ class MLAStage1(nn.Module):
             q = self.wq_b(q)
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+        # 应用 RoPE - 原地更新避免额外内存分配
+        q[..., -rd:] = apply_rotary_emb(q[..., -rd:], freqs_cis)
 
         # KV 投影
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+
+        # 应用 RoPE 到 KV - 原地更新
+        kv[..., -rd:] = apply_rotary_emb(kv[..., -rd:], freqs_cis)
 
         # 更新压缩缓存
         if self.compressor is not None and self.compressor.kv_cache is None:
@@ -421,17 +406,18 @@ class MLAStage1(nn.Module):
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
 
-        # 生成索引（直接在 GPU）
-        device = x.device
-        topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, device)
-        if self.compress_ratio > 0:
-            offset = kv.size(1) if start_pos == 0 else win
-            if self.indexer is not None:
-                compress_idxs = self.indexer(x, qr, start_pos, offset, device)
-            else:
-                compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, offset, device)
-            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-        topk_idxs = topk_idxs.long()
+        # 生成索引 - 禁用梯度计算，纯推理操作
+        with torch.no_grad():
+            device = x.device
+            topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, device)
+            if self.compress_ratio > 0:
+                offset = kv.size(1) if start_pos == 0 else win
+                if self.indexer is not None:
+                    compress_idxs = self.indexer(x, qr, start_pos, offset, device)
+                else:
+                    compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, offset, device)
+                topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+            topk_idxs = topk_idxs.long()
 
         # 缓存更新与注意力计算
         if start_pos == 0:
@@ -454,50 +440,49 @@ class MLAStage1(nn.Module):
         return self.wo(o.flatten(2))
 
     def _apply_attn_sink(self, scores: Tensor) -> Tensor:
-        """应用 Attention Sink 偏差到注意力分数。[b,s,h,k] + [1,1,h,1]"""
+        """应用 Attention Sink 偏差到注意力分数。"""
         return scores + self.attn_sink.view(1, 1, -1, 1)
 
     def _sparse_attn(self, q: Tensor, kv: Tensor, indices: Tensor) -> Tensor:
-        """计算稀疏注意力。"""
+        """计算稀疏注意力 - 优化版：避免维度爆炸，使用广播机制。"""
         bsz, seqlen, k = indices.size()
         rd = self.rope_head_dim
+        h = self.n_local_heads
 
-        # 收集稀疏 KV
+        # gather 稀疏 KV: [b, s*k, head_dim]
         safe_indices = indices.clamp(min=0)
-        sparse_kv = kv.gather(1, safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim))
-        sparse_kv = sparse_kv.view(bsz, seqlen, k, self.head_dim)
+        flat_idx = safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim)
+        sparse_kv = kv.gather(1, flat_idx)
 
-        # 分割 K 和 V: kv 格式为 [nope + rope] 或 [nope + rope + v]
-        # K 使用 nope + rope 部分，V 使用 v_head_dim 部分
+        # 分离 K 和 V: [b, s*k, d]
         kv_nope_rope = self.nope_head_dim + rd
-        k_sparse = sparse_kv[..., :kv_nope_rope]
-        v_sparse = sparse_kv[..., :self.v_head_dim]
+        k_flat = sparse_kv[..., :kv_nope_rope]
+        v_flat = sparse_kv[..., :self.v_head_dim]
 
-        # 扩展维度以匹配注意力计算 [b,s,1,k,d] -> [b,s,h,k,d]
-        k_sparse = k_sparse.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1, -1)
-        v_sparse = v_sparse.unsqueeze(2).expand(-1, -1, self.n_local_heads, -1, -1)
+        # reshape 到 [b, s, k, d]，通过广播避免 expand 到 [b, s, h, k, d]
+        k_sparse = k_flat.view(bsz, seqlen, k, kv_nope_rope)
+        v_sparse = v_flat.view(bsz, seqlen, k, self.v_head_dim)
 
-        # 分离 nope 和 rope 部分
         k_nope, k_pe = torch.split(k_sparse, [self.nope_head_dim, rd], dim=-1)
         q_nope, q_pe = torch.split(q, [self.nope_head_dim, rd], dim=-1)
 
-        # 扩展 q 维度以匹配 k: [b,s,h,d] -> [b,s,h,1,d]
-        q_nope = q_nope.unsqueeze(3)
-        q_pe = q_pe.unsqueeze(3)
-
-        # 计算注意力分数
-        scores = torch.einsum("bshkd,bshkd->bshk", q_nope, k_nope) + \
-                 torch.einsum("bshkd,bshkd->bshk", q_pe, k_pe)
+        # 使用 matmul + 广播计算注意力分数
+        # q: [b, s, h, d], k: [b, s, k, d] -> scores: [b, s, h, k]
+        scores = torch.matmul(
+            q_nope, k_nope.transpose(-2, -1)
+        ) + torch.matmul(
+            q_pe, k_pe.transpose(-2, -1)
+        )
         scores = scores * self.softmax_scale
         scores = self._apply_attn_sink(scores)
 
         # mask
         mask = indices < 0
-        scores += torch.where(mask.unsqueeze(2), float("-inf"), 0)
+        scores.masked_fill_(mask.unsqueeze(2), float("-inf"))
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
-        # 聚合
-        o = torch.einsum("bshk,bshkd->bshd", scores, v_sparse)
+        # 聚合: [b, s, h, k] @ [b, s, k, v] -> [b, s, h, v]
+        o = torch.matmul(scores.unsqueeze(-2), v_sparse.unsqueeze(2)).squeeze(-2)
         return o
 
     def get_kv_cache_size(self) -> int:
