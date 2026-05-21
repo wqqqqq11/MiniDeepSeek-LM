@@ -373,6 +373,36 @@ class MLAStage1(nn.Module):
         """初始化 Attention Sink - 稳定长序列注意力的可学习偏差。"""
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
 
+    def _get_train_indices(self, bsz: int, seqlen: int, device: torch.device) -> Tensor:
+        """训练阶段（start_pos=0）复用固定索引，避免重复计算。"""
+        if not hasattr(self, '_idx_cache'):
+            self._idx_cache: Optional[Tensor] = None
+            self._idx_cache_key: tuple = (-1, -1)
+
+        key = (bsz, seqlen)
+        if self._idx_cache_key == key and self._idx_cache is not None:
+            return self._idx_cache
+
+        with torch.no_grad():
+            idxs = get_window_indices(self.window_size, bsz, seqlen, 0, device)
+            if self.compress_ratio > 0:
+                offset = seqlen
+                if self.indexer is not None:
+                    # indexer 需要 x，训练时无法缓存，走固定索引
+                    c_idxs = get_compress_indices(
+                        self.compress_ratio, bsz, seqlen, 0, offset, device
+                    )
+                else:
+                    c_idxs = get_compress_indices(
+                        self.compress_ratio, bsz, seqlen, 0, offset, device
+                    )
+                idxs = torch.cat([idxs, c_idxs], dim=-1)
+            idxs = idxs.long()
+
+        self._idx_cache = idxs
+        self._idx_cache_key = key
+        return idxs
+
     def forward(self, x: Tensor, start_pos: int = 0) -> Tensor:
         """前向传播：所有层都有窗口注意力，可选压缩注意力。"""
         bsz, seqlen, _ = x.size()
@@ -406,18 +436,31 @@ class MLAStage1(nn.Module):
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
 
-        # 生成索引 - 禁用梯度计算，纯推理操作
-        with torch.no_grad():
-            device = x.device
-            topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, device)
-            if self.compress_ratio > 0:
-                offset = kv.size(1) if start_pos == 0 else win
-                if self.indexer is not None:
-                    compress_idxs = self.indexer(x, qr, start_pos, offset, device)
-                else:
-                    compress_idxs = get_compress_indices(self.compress_ratio, bsz, seqlen, start_pos, offset, device)
-                topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-            topk_idxs = topk_idxs.long()
+        # 生成索引 - 训练阶段缓存，推理阶段实时计算
+        if start_pos == 0:
+            topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
+            if self.compress_ratio > 0 and self.indexer is not None:
+                # CSA 层：使用可学习 indexer，训练时每步需重新计算
+                offset = kv.size(1)
+                with torch.no_grad():
+                    compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
+                    topk_idxs = torch.cat([
+                        get_window_indices(win, bsz, seqlen, 0, x.device),
+                        compress_idxs
+                    ], dim=-1).long()
+        else:
+            with torch.no_grad():
+                topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, x.device)
+                if self.compress_ratio > 0:
+                    offset = win
+                    if self.indexer is not None:
+                        compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
+                    else:
+                        compress_idxs = get_compress_indices(
+                            self.compress_ratio, bsz, seqlen, start_pos, offset, x.device
+                        )
+                    topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+                topk_idxs = topk_idxs.long()
 
         # 缓存更新与注意力计算
         if start_pos == 0:
