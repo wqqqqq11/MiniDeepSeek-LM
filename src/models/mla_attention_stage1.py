@@ -391,7 +391,7 @@ class MLAStage1(nn.Module):
 
     def _init_attn_sink(self):
         """初始化 Attention Sink - 稳定长序列注意力的可学习偏差。"""
-        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
 
     def _get_train_indices(self, bsz: int, seqlen: int, device: torch.device) -> Tensor:
         """训练阶段（start_pos=0）复用固定索引，避免重复计算。"""
@@ -406,7 +406,7 @@ class MLAStage1(nn.Module):
         with torch.no_grad():
             idxs = get_window_indices(self.window_size, bsz, seqlen, 0, device)
             if self.compress_ratio > 0:
-                offset = seqlen
+                offset = self.window_size
                 if self.indexer is not None:
                     # indexer 需要 x，训练时无法缓存，走固定索引
                     c_idxs = get_compress_indices(
@@ -461,7 +461,7 @@ class MLAStage1(nn.Module):
             topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
             if self.compress_ratio > 0 and self.indexer is not None:
                 # CSA 层：使用可学习 indexer，训练时每步需重新计算
-                offset = kv.size(1)
+                offset = win
                 with torch.no_grad():
                     compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
                     topk_idxs = torch.cat([
