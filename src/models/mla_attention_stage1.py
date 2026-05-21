@@ -57,14 +57,32 @@ class Compressor(nn.Module):
             persistent=False
         )
 
-    def overlap_transform(self, tensor: Tensor, value: float = 0) -> Tensor:
-        """重叠窗口变换，使压缩边界更平滑。"""
+        if self.overlap:
+            max_groups = args.max_seq_len // compress_ratio
+            self.register_buffer(
+                "_ol_kv",
+                torch.zeros(max_bsz, max_groups, 2 * compress_ratio, head_dim),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_ol_score",
+                torch.full((max_bsz, max_groups, 2 * compress_ratio, head_dim), float("-inf")),
+                persistent=False,
+            )
+
+    def overlap_transform(self, tensor: Tensor, is_score: bool = False) -> Tensor:
+        """重叠窗口变换 - 使用预分配 buffer 避免反复 malloc。"""
         b, s, _, _ = tensor.size()
         ratio, d = self.compress_ratio, self.head_dim
-        new_tensor = tensor.new_full((b, s, 2 * ratio, d), value)
-        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
-        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
-        return new_tensor
+        with torch.no_grad():
+            buf = self._ol_score[:b, :s] if is_score else self._ol_kv[:b, :s]
+            buf[:, :, ratio:].copy_(tensor[:, :, :, d:])
+            buf[:, 1:, :ratio].copy_(tensor[:, :-1, :, :d])
+            if is_score:
+                buf[:, 0, :ratio] = float("-inf")
+            else:
+                buf[:, 0, :ratio] = 0
+        return buf.clone()
 
     def _compress_prefill(self, x: Tensor, seqlen: int, bsz: int) -> Tuple[Optional[Tensor], bool, int]:
         """预填充阶段压缩。"""
@@ -90,8 +108,8 @@ class Compressor(nn.Module):
         score = score.unflatten(1, (-1, ratio)) + self.ape
 
         if self.overlap:
-            kv = self.overlap_transform(kv, 0)
-            score = self.overlap_transform(score, float("-inf"))
+            kv = self.overlap_transform(kv, is_score=False)
+            score = self.overlap_transform(score, is_score=True)
 
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
 
