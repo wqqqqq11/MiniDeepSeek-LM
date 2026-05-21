@@ -71,8 +71,8 @@ mtp:
 training:
   # num_epochs: 5                 # 总训练轮数
   num_epochs: 45
-  batch_size: 2                 # 批次大小
-  # batch_size: 32  
+  # batch_size: 8                 # 批次大小
+  batch_size: 32  
   gradient_accumulation: 1      # 梯度累积步数
   
   # 学习率调度（三段式）

@@ -498,7 +498,7 @@ class MLAStage1(nn.Module):
                 self.compressor(x, start_pos)
             o = self._sparse_attn(q, self.kv_cache[:bsz], topk_idxs)
 
-        return self.wo(o.flatten(2))
+        return self.wo(o.reshape(bsz, seqlen, -1))
 
     def _apply_attn_sink(self, scores: Tensor) -> Tensor:
         """应用 Attention Sink 偏差到注意力分数。"""
