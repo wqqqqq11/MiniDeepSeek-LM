@@ -96,12 +96,14 @@ class Compressor(nn.Module):
         offset = ratio if self.overlap else 0
 
         if self.overlap and cutoff >= ratio:
-            self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio:cutoff]
-            self.score_state[:bsz, :ratio] = score[:, cutoff - ratio:cutoff] + self.ape[:ratio]
+            self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio:cutoff].detach()
+            self.score_state[:bsz, :ratio] = (score[:, cutoff - ratio:cutoff] + self.ape[:ratio]).detach()
 
         if remainder > 0:
-            kv, self.kv_state[:bsz, offset:offset + remainder] = kv.split([cutoff, remainder], dim=1)
-            self.score_state[:bsz, offset:offset + remainder] = score[:, cutoff:] + self.ape[:remainder]
+            remainder_kv = kv[:, cutoff:]
+            kv = kv[:, :cutoff]
+            self.kv_state[:bsz, offset:offset + remainder] = remainder_kv.detach()
+            self.score_state[:bsz, offset:offset + remainder] = (score[:, cutoff:] + self.ape[:remainder]).detach()
             score = score[:, :cutoff]
 
         kv = kv.unflatten(1, (-1, ratio))
@@ -124,8 +126,8 @@ class Compressor(nn.Module):
         should_compress = (start_pos + 1) % ratio == 0
 
         if self.overlap:
-            self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-            self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+            self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1).detach()
+            self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1).detach()
 
             if should_compress:
                 kv_state = torch.cat([
@@ -137,11 +139,11 @@ class Compressor(nn.Module):
                     self.score_state[:bsz, ratio:, self.head_dim:]
                 ], dim=1)
                 kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+                self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:].detach()
+                self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:].detach()
         else:
-            self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
-            self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+            self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1).detach()
+            self.score_state[:bsz, start_pos % ratio] = score.squeeze(1).detach()
 
             if should_compress:
                 kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
@@ -483,10 +485,11 @@ class MLAStage1(nn.Module):
         # 缓存更新与注意力计算
         if start_pos == 0:
             if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
+                self.kv_cache[:bsz, :seqlen] = kv.detach()
             else:
                 cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                win_kv = kv[:, -win:].detach()
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = win_kv.split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio > 0:
                 kv_compress = self.compressor(x, start_pos)
                 if kv_compress is not None:
