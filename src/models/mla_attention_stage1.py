@@ -406,7 +406,7 @@ class MLAStage1(nn.Module):
         with torch.no_grad():
             idxs = get_window_indices(self.window_size, bsz, seqlen, 0, device)
             if self.compress_ratio > 0:
-                offset = self.window_size
+                offset = seqlen
                 if self.indexer is not None:
                     # indexer 需要 x，训练时无法缓存，走固定索引
                     c_idxs = get_compress_indices(
@@ -461,7 +461,7 @@ class MLAStage1(nn.Module):
             topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
             if self.compress_ratio > 0 and self.indexer is not None:
                 # CSA 层：使用可学习 indexer，训练时每步需重新计算
-                offset = win
+                offset = kv.size(1)
                 with torch.no_grad():
                     compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
                     topk_idxs = torch.cat([
@@ -499,7 +499,14 @@ class MLAStage1(nn.Module):
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio > 0:
                 self.compressor(x, start_pos)
-            o = self._sparse_attn(q, self.kv_cache[:bsz], topk_idxs)
+                n_compress = (start_pos + 1) // self.compress_ratio
+                attn_kv = torch.cat([
+                    self.kv_cache[:bsz],
+                    self.kv_compress_cache[:bsz, :n_compress]
+                ], dim=1)
+            else:
+                attn_kv = self.kv_cache[:bsz]
+            o = self._sparse_attn(q, attn_kv, topk_idxs)
 
         return self.wo(o.reshape(bsz, seqlen, -1))
 
