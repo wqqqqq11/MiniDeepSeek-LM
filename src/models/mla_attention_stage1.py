@@ -444,46 +444,23 @@ class MLAStage1(nn.Module):
         return scores + self.attn_sink.view(1, 1, -1, 1)
 
     def _sparse_attn(self, q: Tensor, kv: Tensor, indices: Tensor) -> Tensor:
-        """计算稀疏注意力 - 优化版：避免维度爆炸，使用广播机制。"""
+        """计算稀疏注意力 - 优化版：单次 matmul，合并 nope+rope 计算。"""
         bsz, seqlen, k = indices.size()
-        rd = self.rope_head_dim
-        h = self.n_local_heads
 
         # gather 稀疏 KV: [b, s*k, head_dim]
         safe_indices = indices.clamp(min=0)
         flat_idx = safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim)
-        sparse_kv = kv.gather(1, flat_idx)
+        k_sparse = kv.gather(1, flat_idx).view(bsz, seqlen, k, self.head_dim)
+        v_sparse = k_sparse[..., :self.v_head_dim]
 
-        # 分离 K 和 V: [b, s*k, d]
-        kv_nope_rope = self.nope_head_dim + rd
-        k_flat = sparse_kv[..., :kv_nope_rope]
-        v_flat = sparse_kv[..., :self.v_head_dim]
-
-        # reshape 到 [b, s, k, d]，通过广播避免 expand 到 [b, s, h, k, d]
-        k_sparse = k_flat.view(bsz, seqlen, k, kv_nope_rope)
-        v_sparse = v_flat.view(bsz, seqlen, k, self.v_head_dim)
-
-        k_nope, k_pe = torch.split(k_sparse, [self.nope_head_dim, rd], dim=-1)
-        q_nope, q_pe = torch.split(q, [self.nope_head_dim, rd], dim=-1)
-
-        # 使用 matmul + 广播计算注意力分数
-        # q: [b, s, h, d], k: [b, s, k, d] -> scores: [b, s, h, k]
-        scores = torch.matmul(
-            q_nope, k_nope.transpose(-2, -1)
-        ) + torch.matmul(
-            q_pe, k_pe.transpose(-2, -1)
-        )
-        scores = scores * self.softmax_scale
+        # 单次 matmul：q[b,s,h,d] × k[b,s,k,d]ᵀ → [b,s,h,k]
+        scores = torch.matmul(q, k_sparse.transpose(-2, -1)) * self.softmax_scale
         scores = self._apply_attn_sink(scores)
-
-        # mask
-        mask = indices < 0
-        scores.masked_fill_(mask.unsqueeze(2), float("-inf"))
+        scores.masked_fill_(indices.unsqueeze(2) < 0, float("-inf"))
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
-        # 聚合: [b, s, h, k] @ [b, s, k, v] -> [b, s, h, v]
-        o = torch.matmul(scores.unsqueeze(-2), v_sparse.unsqueeze(2)).squeeze(-2)
-        return o
+        # einsum 聚合，允许编译器融合
+        return torch.einsum("bshk,bskd->bshd", scores, v_sparse)
 
     def get_kv_cache_size(self) -> int:
         """获取 KV 缓存大小（以元素计）。"""
