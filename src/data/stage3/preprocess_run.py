@@ -16,6 +16,7 @@ sys.path.insert(0, str(project_root))
 
 from src.data.stage3.config import SFTDownloadConfig
 from src.data.stage3.sft.downloader import SFTDownloader
+from src.data.stage3.sft.converter import SFTConverter
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -42,6 +43,16 @@ def run_stage_0_download(domain: str) -> None:
         downloader._download_science()
     else:
         raise ValueError(f"未知领域: {domain}")
+
+
+def run_stage_1_convert(domain: str) -> None:
+    """运行 Stage 1: 转换数据格式"""
+    converter = SFTConverter()
+
+    if domain == "all":
+        converter.convert_all()
+    else:
+        converter._convert_domain(domain)
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +99,8 @@ def main() -> int:
     try:
         if args.stage == 0:
             run_stage_0_download(args.domain)
+        elif args.stage == 1:
+            run_stage_1_convert(args.domain)
         else:
             logger.warning(f"Stage {args.stage} 尚未实现")
             return 1
