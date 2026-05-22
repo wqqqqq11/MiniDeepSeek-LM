@@ -52,8 +52,7 @@
 
     专家类型	总 Token	SFT（90%，基础能力）	GRPO（10%，专家强化）	数据集与组合比例
     数学推理	2M	        1.8M	                0.2M	             SFT：
-                                                                    1. openbmb/UltraData-Math：70%
-                                                                    2. AI-MO/NuminaMath-CoT：30% 
+                                                                    1. AI-MO/NuminaMath-CoT：100% 
 
                                                                   GRPO：
                                                                     1. openai/gsm8k：100%
@@ -65,15 +64,13 @@
                                                                   GRPO：
                                                                     1. codeparrot/apps（小 prompt pool）：100%
                 
-    科研学术	2M	        40M	                10M	                 SFT：         
-                                                                    1. allenai/SciRIFF：60% 
-                                                                    2. qiaojin/PubMedQA：40%
+    科研学术	2M	        1.8M	                0.2M	       SFT：         
+                                                                    1. qiaojin/PubMedQA：100%
 
                                                                   GRPO：
                                                                     1. allenai/scifact：100% 
     
     注意：SFT 和 GRPO 可以使用同源数据集，但必须切分不同样本池。
-            test split 不参与训练。
 
 ## 阶段 4：OPD 最优路径蒸馏合并
     把阶段 3 训练好的3 个独立领域专家，通过 OPD 蒸馏策略，合并融合进同一个主模型
