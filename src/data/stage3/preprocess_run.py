@@ -17,6 +17,7 @@ sys.path.insert(0, str(project_root))
 from src.data.stage3.config import SFTDownloadConfig
 from src.data.stage3.sft.downloader import SFTDownloader
 from src.data.stage3.sft.converter import SFTConverter
+from src.data.stage3.sft.tokenizer import SFTTokenizer
 
 
 def setup_logging(level: int = logging.INFO) -> None:
@@ -53,6 +54,16 @@ def run_stage_1_convert(domain: str) -> None:
         converter.convert_all()
     else:
         converter._convert_domain(domain)
+
+
+def run_stage_2_tokenize(domain: str) -> None:
+    """运行 Stage 2: Tokenize 数据"""
+    tokenizer = SFTTokenizer()
+
+    if domain == "all":
+        tokenizer.tokenize_all()
+    else:
+        tokenizer._tokenize_domain(domain)
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +112,8 @@ def main() -> int:
             run_stage_0_download(args.domain)
         elif args.stage == 1:
             run_stage_1_convert(args.domain)
+        elif args.stage == 2:
+            run_stage_2_tokenize(args.domain)
         else:
             logger.warning(f"Stage {args.stage} 尚未实现")
             return 1
