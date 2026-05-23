@@ -37,6 +37,8 @@ class Compressor(nn.Module):
 
         coff = 1 + self.overlap
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim))
+        nn.init.normal_(self.ape, mean=0.0, std=0.02)
+
         self.wkv = nn.Linear(self.dim, coff * head_dim, bias=False)
         self.wgate = nn.Linear(self.dim, coff * head_dim, bias=False)
         self.norm = RMSNorm(head_dim, args.norm_eps)
@@ -433,9 +435,12 @@ class MLAStage1(nn.Module):
         freqs_cis = self.freqs_cis[start_pos:end_pos]
 
         # Query 投影
-        qr = q = self.q_norm(self.wq_a(x)) if self.q_lora_rank > 0 else x
         if self.q_lora_rank > 0:
-            q = self.wq_b(q)
+            qr = self.q_norm(self.wq_a(x))
+            q = self.wq_b(qr)
+        else:
+            q = self.wq(x)
+            qr = q
         q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-6)
 

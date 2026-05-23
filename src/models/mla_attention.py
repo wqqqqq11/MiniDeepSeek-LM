@@ -38,6 +38,8 @@ class Compressor(nn.Module):
 
         coff = 1 + self.overlap
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim, dtype=torch.float32))
+        nn.init.normal_(self.ape, mean=0.0, std=0.02)
+
         self.wkv = Linear(self.dim, coff * head_dim, dtype=torch.float32)
         self.wgate = Linear(self.dim, coff * head_dim, dtype=torch.float32)
         self.norm = RMSNorm(head_dim, args.norm_eps)
@@ -316,7 +318,7 @@ class MLA(nn.Module):
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
 
         # Attention Sink（稳定长序列注意力的可学习偏差）
-        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
 
         # Softmax 缩放（含 YaRN 长序列调整）
         self.softmax_scale = self.head_dim ** -0.5
