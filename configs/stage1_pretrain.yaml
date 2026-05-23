@@ -50,7 +50,7 @@ model:
   compress_ratios: [4, 2, 4, 2, 4, 2, 4, 2]  # HCA=512, CSA=16
   index_topk: 128                              # CSA 检索 Top-k 数量
   window_size: 128                             # CSA 滑动窗口大小
-  hc_mult: 2                                   # 不使用 Hyper-Connections
+  hc_mult: 1                                   # 不使用 Hyper-Connections
   
   # 权重共享
   tie_word_embeddings: true

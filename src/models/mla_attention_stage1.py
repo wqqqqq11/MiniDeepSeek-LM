@@ -75,14 +75,20 @@ class Compressor(nn.Module):
     def overlap_transform(self, tensor: Tensor, is_score: bool = False) -> Tensor:
         """重叠窗口变换，训练时可微，推理时高效。"""
         ratio, d = self.compress_ratio, self.head_dim
+        pad_value = float("-inf") if is_score else 0
+        groups = tensor.size(1)
 
-        if self.training:
+        # groups < 2 时无法做 overlap shift，但仍需 reshape
+        if self.training or groups < 2:
             cur = tensor[..., d:]
             prev = tensor[..., :d]
 
-            pad_value = float("-inf") if is_score else 0
-            first = torch.full_like(prev[:, :1], pad_value)
-            prev_shift = torch.cat([first, prev[:, :-1]], dim=1)
+            if groups >= 2:
+                first = torch.full_like(prev[:, :1], pad_value)
+                prev_shift = torch.cat([first, prev[:, :-1]], dim=1)
+            else:
+                # groups == 1，没有前一个 group 可 shift，用全 pad
+                prev_shift = torch.full_like(prev, pad_value)
 
             return torch.cat([prev_shift, cur], dim=2)
 
@@ -90,7 +96,8 @@ class Compressor(nn.Module):
         with torch.no_grad():
             buf = self._ol_score[:b, :s] if is_score else self._ol_kv[:b, :s]
             buf[:, :, ratio:].copy_(tensor[..., d:])
-            buf[:, 1:, :ratio].copy_(tensor[..., :d])
+            if s > 1:
+                buf[:, 1:, :ratio].copy_(tensor[:, :-1, :, :d])
             buf[:, 0, :ratio] = pad_value
         return buf.clone()
 
@@ -121,7 +128,7 @@ class Compressor(nn.Module):
         kv = kv.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape
 
-        if self.overlap:
+        if self.overlap and kv.size(1) > 0:
             kv = self.overlap_transform(kv, is_score=False)
             score = self.overlap_transform(score, is_score=True)
 
@@ -486,10 +493,11 @@ class MLAStage1(nn.Module):
                 if kv_compress is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
 
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv.detach() if not self.training else kv
+            kv_len = kv.size(1)
+            if kv_len <= win:
+                self.kv_cache[:bsz, :kv_len] = kv.detach() if not self.training else kv
             else:
-                cutoff = seqlen % win
+                cutoff = kv_len % win
                 win_kv = kv[:, -win:]
                 win_kv = win_kv.detach() if not self.training else win_kv
                 self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = win_kv.split([win - cutoff, cutoff], dim=1)
