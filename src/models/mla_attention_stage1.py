@@ -247,7 +247,7 @@ class Indexer(nn.Module):
 
             n_available = end_pos // ratio
             if n_available == 0:
-                return torch.zeros(bsz, seqlen, 1, device=device, dtype=torch.int64) + offset
+                return torch.full((bsz, seqlen, 1), -1, device=device, dtype=torch.int64)
 
             k = min(self.index_topk, n_available)
             topk_idxs = index_score.topk(k, dim=-1)[1]
@@ -255,9 +255,6 @@ class Indexer(nn.Module):
             if start_pos == 0:
                 mask = topk_idxs >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
                 topk_idxs = torch.where(mask, -1, topk_idxs + offset)
-                first_col = topk_idxs[:, :, 0]
-                first_col = torch.clamp(first_col, min=0)
-                topk_idxs = torch.cat([first_col.unsqueeze(-1), topk_idxs[:, :, 1:]], dim=-1)
             else:
                 topk_idxs = topk_idxs + offset
 
@@ -294,21 +291,18 @@ def get_compress_indices(compress_ratio: int, bsz: int, seqlen: int, start_pos: 
         if start_pos > 0:
             n_compress = (start_pos + 1) // compress_ratio
             if n_compress == 0:
-                indices = torch.zeros(1, device=device, dtype=torch.int64)
+                indices = torch.full((1,), -1, device=device, dtype=torch.int64)
             else:
                 indices = torch.arange(0, n_compress, device=device) + offset
         else:
             n_available = seqlen // compress_ratio
             if n_available == 0:
-                indices = torch.zeros(seqlen, 1, device=device, dtype=torch.int64)
+                indices = torch.full((seqlen, 1), -1, device=device, dtype=torch.int64)
             else:
                 base = torch.arange(seqlen, device=device).unsqueeze(1)
                 indices = torch.arange(n_available, device=device).repeat(seqlen, 1)
                 mask = indices >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // compress_ratio
                 indices = torch.where(mask, -1, indices + offset)
-                all_masked = mask.all(dim=1)
-                if all_masked.any():
-                    indices[all_masked, 0] = offset
 
         return indices.unsqueeze(0).expand(bsz, -1, -1).to(torch.int64)
 
@@ -532,8 +526,11 @@ class MLAStage1(nn.Module):
         return self.wo(o.reshape(bsz, seqlen, -1))
 
     def _apply_attn_sink(self, scores: Tensor) -> Tensor:
-        """应用 Attention Sink 偏差到注意力分数。"""
-        return scores + self.attn_sink.view(1, 1, -1, 1)
+        """只对 sink token 位置（第 0 个 key）加偏差，稳定长序列注意力。"""
+        # scores: [batch, seq_len, n_heads, n_keys]
+        # 只给第 0 个 key 位置加 bias，softmax 后 sink token 的权重会增大
+        scores[..., 0] += self.attn_sink
+        return scores
 
     def _sparse_attn(self, q: Tensor, kv: Tensor, indices: Tensor) -> Tensor:
         """计算稀疏注意力 - 优化版：单次 matmul，合并 nope+rope 计算。"""
