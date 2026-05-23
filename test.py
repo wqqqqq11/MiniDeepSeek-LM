@@ -91,7 +91,7 @@ def test_stage1(config, logger):
 
     # 加载检查点
     logger.info("\n[2] 加载模型检查点")
-    ckpt_path = Path(cfg["logging"]["checkpoint_dir"]) / "best.pt"
+    ckpt_path = Path(cfg["logging"]["checkpoint_dir"]) / "checkpoint_epoch0_20260523_184731.pt"
 
     if not ckpt_path.exists():
         logger.info(f"  检查点不存在: {ckpt_path}")

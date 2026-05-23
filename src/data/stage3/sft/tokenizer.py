@@ -21,7 +21,7 @@ from ..utils.downloader_utils import CheckpointManager, format_duration
 logger = logging.getLogger(__name__)
 
 # 最大序列长度
-MAX_SEQ_LEN = 1536
+MAX_SEQ_LEN = 512
 
 
 class SFTTokenizer:

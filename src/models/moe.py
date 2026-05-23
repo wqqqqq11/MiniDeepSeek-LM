@@ -167,17 +167,13 @@ class Gate(nn.Module):
         # 动态更新偏置（无梯度，纯统计更新）
         self.expert_bias += self.bias_update_speed * (target_freq - self.freq_ema)
 
-    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
-        """
-        门控前向传播。
+    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None, forced_expert_id: Optional[int] = None):
+        if forced_expert_id is not None:
+            batch_size = x.size(0)
+            indices = torch.full((batch_size, self.topk), forced_expert_id, dtype=torch.long, device=x.device)
+            weights = torch.ones(batch_size, self.topk, dtype=torch.float32, device=x.device)
+            return weights, indices
 
-        Args:
-            x: 输入 [num_tokens, dim]。
-            input_ids: token IDs [num_tokens]，hash路由时需要。
-
-        Returns:
-            (weights, indices): 专家权重和索引。
-        """
         if self.hash:
             return self._hash_route(input_ids)
         else:
@@ -214,29 +210,17 @@ class MoE(nn.Module):
         # 共享专家
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
-    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        前向传播。
-
-        Args:
-            x: 输入 [batch, seq, dim]。
-            input_ids: token IDs [batch, seq]，hash路由时使用。
-
-        Returns:
-            输出 [batch, seq, dim]。
-        """
+    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None, forced_expert_id: Optional[int] = None) -> torch.Tensor:
         shape = x.shape
         x = x.view(-1, self.dim)
 
-        # 获取路由信息
         if input_ids is not None:
             flat_ids = input_ids.flatten()
         else:
             flat_ids = None
 
-        weights, indices = self.gate(x, flat_ids)
+        weights, indices = self.gate(x, flat_ids, forced_expert_id)
 
-        # 收集各专家输出
         expert_outs = []
         for i in range(self.n_routed_experts):
             mask = (indices == i).any(dim=-1)
@@ -249,7 +233,6 @@ class MoE(nn.Module):
             out = expert(x[mask]) * w
             expert_outs.append((idx, out))
 
-        # 合并专家输出
         if expert_outs:
             all_idx = torch.cat([idx for idx, _ in expert_outs])
             all_out = torch.cat([out for _, out in expert_outs], dim=0)
@@ -258,7 +241,6 @@ class MoE(nn.Module):
         else:
             y = torch.zeros_like(x)
 
-        # 共享专家（所有token经过）
         z = self.shared_experts(x)
 
         return (y + z).view(shape)

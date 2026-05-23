@@ -1,7 +1,7 @@
 """Stage 3 SFT 数据预处理运行入口
 
 Usage:
-    python preprocess_run.py --stage 0 --domain all
+    python src\data\stage3\preprocess_run.py --stage 0 --domain all
     python preprocess_run.py --stage 0 --domain math
 """
 

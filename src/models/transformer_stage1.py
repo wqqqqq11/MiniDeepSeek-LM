@@ -115,24 +115,21 @@ class BlockStage1(nn.Module):
         x: torch.Tensor,
         input_ids: torch.Tensor,
         start_pos: int = 0,
+        forced_expert_id: Optional[int] = None,
     ) -> torch.Tensor:
-        """前向传播。"""
         if self.hc_mult == 1:
-            # 标准残差连接
             h = x + self.attn(self.attn_norm(x), start_pos)
-            out = h + self.mlp(self.mlp_norm(h), input_ids)
+            out = h + self.mlp(self.mlp_norm(h), input_ids, forced_expert_id)
             return out
 
-        # Attention 子层（带 HC）
         residual = x
         x, post, comb = self._hc_pre(residual, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attn(self.attn_norm(x), start_pos)
         x = self._hc_post(x, residual, post, comb)
 
-        # MoE 子层（带 HC）
         residual = x
         x, post, comb = self._hc_pre(residual, self.hc_mlp_fn, self.hc_mlp_scale, self.hc_mlp_base)
-        x = self.mlp(self.mlp_norm(x), input_ids)
+        x = self.mlp(self.mlp_norm(x), input_ids, forced_expert_id)
         x = self._hc_post(x, residual, post, comb)
 
         return x
@@ -203,19 +200,16 @@ class TransformerStage1(nn.Module):
         tokens: torch.Tensor,
         start_pos: int = 0,
         return_mtp: bool = False,
+        forced_expert_id: Optional[int] = None,
     ) -> torch.Tensor:
-        """前向传播。"""
         h = self.embed(tokens)
 
-        # HC 扩展
         if self.hc_mult > 1:
             h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1)
 
-        # 逐层传递
         for layer in self.layers:
-            h = layer(h, tokens, start_pos)
+            h = layer(h, tokens, start_pos, forced_expert_id)
 
-        # HC 合并
         if self.hc_mult > 1:
             h = self._hc_head(h)
 

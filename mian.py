@@ -3,6 +3,7 @@
 
 用法:
     python mian.py --stage 1 --config configs/stage1_pretrain.yaml
+    python mian.py --stage 3 --config configs/stage1_pretrain.yaml --domain math
 """
 
 import argparse
@@ -12,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from datetime import datetime
+from torch.utils.data import DataLoader
 
 from src.models.config import ModelArgs
 from src.models.transformer_stage1 import TransformerStage1
@@ -266,18 +268,93 @@ def evaluate(model, cfg, device, vocab_size):
     return total_loss / num_batches if num_batches > 0 else 0.0
 
 
+from src.training.stages.stage3_domain_sft import train_domain_sft
+from src.training.sft.dataset import SFTArrowDataset, collate_fn
+
+
+def train_stage3(config, domain):
+    if domain not in config["sft"]["domains"]:
+        raise ValueError(f"Unknown domain: {domain}")
+    
+    domain_cfg = config["sft"]["domains"][domain]
+    expert_id = domain_cfg["expert_id"]
+    train_data_dir = domain_cfg["train_data"]
+    val_data_dir = domain_cfg["val_data"]
+    
+    device = torch.device(config["hardware"]["device"])
+    
+    model_args = ModelArgs.stage1()
+    model_cfg = config["model"]
+    model_args.vocab_size = model_cfg["vocab_size"]
+    model_args.dim = model_cfg["dim"]
+    model_args.n_layers = model_cfg["n_layers"]
+    model_args.n_heads = model_cfg["n_heads"]
+    model_args.max_seq_len = model_cfg["max_seq_len"]
+    model_args.q_lora_rank = model_cfg["q_lora_rank"]
+    model_args.kv_lora_rank = model_cfg["kv_lora_rank"]
+    model_args.head_dim = model_cfg["head_dim"]
+    
+    model = TransformerStage1(model_args)
+    
+    checkpoint_path = config["sft"]["base_checkpoint"]
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(checkpoint["model"])
+    print(f"Loaded base checkpoint: {checkpoint_path}")
+    
+    train_dataset = SFTArrowDataset(train_data_dir)
+    val_dataset = SFTArrowDataset(val_data_dir)
+    
+    batch_size = config["sft"]["batch_size"]
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+        drop_last=True,
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        drop_last=True,
+    )
+    
+    output_dir = config["sft"]["output_dir"]
+    
+    train_domain_sft(
+        model,
+        train_loader,
+        val_loader,
+        config,
+        device,
+        expert_id,
+        output_dir,
+        domain,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", type=int, default=1, help="训练阶段")
     parser.add_argument("--config", type=str, required=True, help="配置文件路径")
+    parser.add_argument("--domain", type=str, default=None, help="阶段3的领域(math/code/science)")
     args = parser.parse_args()
 
-    if args.stage != 1:
+    config = load_yaml(args.config)
+
+    if args.stage == 1:
+        train_stage1(config)
+    elif args.stage == 3:
+        if args.domain is None:
+            print("阶段3需要指定 --domain 参数")
+            return
+        train_stage3(config, args.domain)
+    else:
         print(f"阶段 {args.stage} 暂未实现")
         return
-
-    config = load_yaml(args.config)
-    train_stage1(config)
 
 
 if __name__ == "__main__":
