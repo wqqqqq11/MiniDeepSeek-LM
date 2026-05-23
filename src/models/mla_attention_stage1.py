@@ -465,29 +465,50 @@ class MLAStage1(nn.Module):
         # 应用 RoPE 到 KV - 原地更新
         kv[..., -rd:] = apply_rotary_emb(kv[..., -rd:], freqs_cis)
 
-        # 更新压缩缓存
+        # 延迟绑定压缩缓存（首次调用时）
         if self.compressor is not None and self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_compress_cache
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
 
-        # 生成索引 - 训练阶段缓存，推理阶段实时计算
+        # 先生成窗口索引，再更新压缩缓存，最后生成压缩索引
+        # 保证 indexer 看到的是包含当前 step 的最新缓存
         if start_pos == 0:
             topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
-            if self.compress_ratio > 0 and self.indexer is not None:
-                # CSA 层：使用可学习 indexer，训练时每步需重新计算
-                offset = kv.size(1)
-                with torch.no_grad():
-                    compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
-                    topk_idxs = torch.cat([
-                        get_window_indices(win, bsz, seqlen, 0, x.device),
-                        compress_idxs
-                    ], dim=-1).long()
+
+            if self.compress_ratio > 0:
+                kv_compress = self.compressor(x, start_pos)
+
+                if self.indexer is not None:
+                    offset = kv.size(1)
+                    with torch.no_grad():
+                        compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
+                        topk_idxs = torch.cat([
+                            get_window_indices(win, bsz, seqlen, 0, x.device),
+                            compress_idxs
+                        ], dim=-1).long()
+
+                if kv_compress is not None:
+                    kv = torch.cat([kv, kv_compress], dim=1)
+
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv.detach() if not self.training else kv
+            else:
+                cutoff = seqlen % win
+                win_kv = kv[:, -win:]
+                win_kv = win_kv.detach() if not self.training else win_kv
+                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = win_kv.split([win - cutoff, cutoff], dim=1)
+
+            o = self._sparse_attn(q, kv, topk_idxs)
         else:
             with torch.no_grad():
                 topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, x.device)
-                if self.compress_ratio > 0:
+
+            if self.compress_ratio > 0:
+                self.compressor(x, start_pos)
+
+                with torch.no_grad():
                     offset = win
                     if self.indexer is not None:
                         compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
@@ -495,26 +516,8 @@ class MLAStage1(nn.Module):
                         compress_idxs = get_compress_indices(
                             self.compress_ratio, bsz, seqlen, start_pos, offset, x.device
                         )
-                    topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-                topk_idxs = topk_idxs.long()
+                    topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1).long()
 
-        # 缓存更新与注意力计算
-        if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv.detach()
-            else:
-                cutoff = seqlen % win
-                win_kv = kv[:, -win:].detach()
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = win_kv.split([win - cutoff, cutoff], dim=1)
-            if self.compress_ratio > 0:
-                kv_compress = self.compressor(x, start_pos)
-                if kv_compress is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
-            o = self._sparse_attn(q, kv, topk_idxs)
-        else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
-            if self.compress_ratio > 0:
-                self.compressor(x, start_pos)
                 n_compress = (start_pos + 1) // self.compress_ratio
                 attn_kv = torch.cat([
                     self.kv_cache[:bsz],
@@ -522,6 +525,8 @@ class MLAStage1(nn.Module):
                 ], dim=1)
             else:
                 attn_kv = self.kv_cache[:bsz]
+
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             o = self._sparse_attn(q, attn_kv, topk_idxs)
 
         return self.wo(o.reshape(bsz, seqlen, -1))
