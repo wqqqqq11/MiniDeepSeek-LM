@@ -18,6 +18,7 @@ from src.training.dataset import TokenDataset
 from src.training.lr_scheduler import create_scheduler
 from src.training.logger import TrainingLogger, get_gpu_memory
 from src.training.utils.util import set_seed, count_parameters, clip_gradients
+from src.training.utils.early_stopping import EarlyStopping
 
 
 def load_yaml(path):
@@ -117,6 +118,13 @@ def train_stage1(config):
     # 最优模型跟踪
     best_ppl = float("inf")
 
+    # 早停器
+    es_cfg = cfg.get("early_stopping", {})
+    early_stopping = EarlyStopping(
+        patience=es_cfg.get("patience", 5),
+        enabled=es_cfg.get("enabled", True),
+    )
+
     # 训练循环
     step_start_time = time.time()
     
@@ -189,6 +197,11 @@ def train_stage1(config):
         logger.log_eval(epoch + 1, val_loss, val_ppl)
         logger.log_epoch_end(epoch + 1, avg_loss, val_loss)
 
+        # 早停检查
+        if early_stopping.step(val_ppl):
+            logger.logger.info(f"[EarlyStop] 早停触发，ppl连续{early_stopping.counter}轮未降低")
+            break
+
         # 保存检查点（基于 PPL）
         if val_ppl < best_ppl:
             best_ppl = val_ppl
@@ -199,6 +212,7 @@ def train_stage1(config):
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
+                "early_stopping": early_stopping.state_dict(),
                 "val_loss": val_loss,
                 "val_ppl": val_ppl,
             }, ckpt_path)

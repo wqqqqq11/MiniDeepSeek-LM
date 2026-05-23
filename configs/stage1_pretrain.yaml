@@ -119,14 +119,19 @@ data:
 logging:
   log_dir: "logs/stage1"
   checkpoint_dir: "checkpoints/stage1"
-  
+
   # 保存策略
   save_best_only: true            # 只保存最优模型
   eval_every_epoch: true          # 每 epoch 验证一次
-  
+
   # 记录频率
   log_every_steps: 10
   tensorboard_port: 6006
+
+# 早停配置
+early_stopping:
+  enabled: true                   # 是否启用早停
+  patience: 5                     # 验证ppl不降低的容忍轮数
 
 # 硬件配置
 hardware:
