@@ -73,17 +73,25 @@ class Compressor(nn.Module):
             )
 
     def overlap_transform(self, tensor: Tensor, is_score: bool = False) -> Tensor:
-        """重叠窗口变换 - 使用预分配 buffer 避免反复 malloc。"""
-        b, s, _, _ = tensor.size()
+        """重叠窗口变换，训练时可微，推理时高效。"""
         ratio, d = self.compress_ratio, self.head_dim
+
+        if self.training:
+            cur = tensor[..., d:]
+            prev = tensor[..., :d]
+
+            pad_value = float("-inf") if is_score else 0
+            first = torch.full_like(prev[:, :1], pad_value)
+            prev_shift = torch.cat([first, prev[:, :-1]], dim=1)
+
+            return torch.cat([prev_shift, cur], dim=2)
+
+        b, s, _, _ = tensor.size()
         with torch.no_grad():
             buf = self._ol_score[:b, :s] if is_score else self._ol_kv[:b, :s]
-            buf[:, :, ratio:].copy_(tensor[:, :, :, d:])
-            buf[:, 1:, :ratio].copy_(tensor[:, :-1, :, :d])
-            if is_score:
-                buf[:, 0, :ratio] = float("-inf")
-            else:
-                buf[:, 0, :ratio] = 0
+            buf[:, :, ratio:].copy_(tensor[..., d:])
+            buf[:, 1:, :ratio].copy_(tensor[..., :d])
+            buf[:, 0, :ratio] = pad_value
         return buf.clone()
 
     def _compress_prefill(self, x: Tensor, seqlen: int, bsz: int) -> Tuple[Optional[Tensor], bool, int]:
@@ -97,15 +105,17 @@ class Compressor(nn.Module):
         cutoff = seqlen - remainder
         offset = ratio if self.overlap else 0
 
+        maybe_detach = lambda t: t.detach() if not self.training else t
+
         if self.overlap and cutoff >= ratio:
-            self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio:cutoff].detach()
-            self.score_state[:bsz, :ratio] = (score[:, cutoff - ratio:cutoff] + self.ape[:ratio]).detach()
+            self.kv_state[:bsz, :ratio] = maybe_detach(kv[:, cutoff - ratio:cutoff])
+            self.score_state[:bsz, :ratio] = maybe_detach(score[:, cutoff - ratio:cutoff] + self.ape[:ratio])
 
         if remainder > 0:
             remainder_kv = kv[:, cutoff:]
             kv = kv[:, :cutoff]
-            self.kv_state[:bsz, offset:offset + remainder] = remainder_kv.detach()
-            self.score_state[:bsz, offset:offset + remainder] = (score[:, cutoff:] + self.ape[:remainder]).detach()
+            self.kv_state[:bsz, offset:offset + remainder] = maybe_detach(remainder_kv)
+            self.score_state[:bsz, offset:offset + remainder] = maybe_detach(score[:, cutoff:] + self.ape[:remainder])
             score = score[:, :cutoff]
 
         kv = kv.unflatten(1, (-1, ratio))
@@ -126,10 +136,11 @@ class Compressor(nn.Module):
         score = self.wgate(x) + self.ape[start_pos % ratio]
 
         should_compress = (start_pos + 1) % ratio == 0
+        maybe_detach = lambda t: t.detach() if not self.training else t
 
         if self.overlap:
-            self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1).detach()
-            self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1).detach()
+            self.kv_state[:bsz, ratio + start_pos % ratio] = maybe_detach(kv.squeeze(1))
+            self.score_state[:bsz, ratio + start_pos % ratio] = maybe_detach(score.squeeze(1))
 
             if should_compress:
                 kv_state = torch.cat([
@@ -141,11 +152,11 @@ class Compressor(nn.Module):
                     self.score_state[:bsz, ratio:, self.head_dim:]
                 ], dim=1)
                 kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:].detach()
-                self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:].detach()
+                self.kv_state[:bsz, :ratio] = maybe_detach(self.kv_state[:bsz, ratio:])
+                self.score_state[:bsz, :ratio] = maybe_detach(self.score_state[:bsz, ratio:])
         else:
-            self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1).detach()
-            self.score_state[:bsz, start_pos % ratio] = score.squeeze(1).detach()
+            self.kv_state[:bsz, start_pos % ratio] = maybe_detach(kv.squeeze(1))
+            self.score_state[:bsz, start_pos % ratio] = maybe_detach(score.squeeze(1))
 
             if should_compress:
                 kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
