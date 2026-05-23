@@ -183,11 +183,19 @@ class SFTTokenizer:
     ) -> tuple:
         """统一序列长度：截断或填充到 MAX_SEQ_LEN"""
         seq_len = len(input_ids)
+        eos_id = self.tokenizer.eos_token_id
 
         if seq_len > MAX_SEQ_LEN:
-            # 截断
-            input_ids = input_ids[:MAX_SEQ_LEN]
-            labels = labels[:MAX_SEQ_LEN]
+            # 截断：保留最后一个 token 给 eos
+            truncate_pos = MAX_SEQ_LEN - 1
+
+            # 判断截断位置是否在 assistant 中
+            is_in_assistant = labels[truncate_pos] != -100
+
+            # 截断并强制以 eos 结尾
+            input_ids = input_ids[:truncate_pos] + [eos_id]
+            labels = labels[:truncate_pos] + [eos_id if is_in_assistant else -100]
+
             attention_mask = [1] * MAX_SEQ_LEN
         else:
             # 填充
@@ -212,13 +220,9 @@ class SFTTokenizer:
         messages: List[Dict],
         input_ids: List[int]
     ) -> List[int]:
-        """
-        生成 labels。
-        策略：找到 assistant 消息对应的 token 范围，设为 token_ids，
-        其他设为 -100。
-        """
-        # 默认全部 -100
+        """生成 labels。system/user = -100，assistant = token_ids，eos 需要学习"""
         labels = [-100] * len(input_ids)
+        eos_id = self.tokenizer.eos_token_id
 
         # 找到最后一条 assistant 消息的内容
         assistant_content = None
@@ -230,7 +234,7 @@ class SFTTokenizer:
         if not assistant_content:
             return labels
 
-        # 编码 assistant 内容（不添加 special tokens，因为 template 中已有）
+        # 编码 assistant 内容
         assistant_tokens = self.tokenizer.encode(
             assistant_content,
             add_special_tokens=False
@@ -243,10 +247,14 @@ class SFTTokenizer:
         pos = self._find_subsequence(input_ids, assistant_tokens)
 
         if pos >= 0:
-            # 设置 labels（包含 eos token，模型需要学习何时结束）
+            # 设置 assistant tokens 的 labels
             end_pos = min(pos + len(assistant_tokens), len(input_ids))
             for i in range(pos, end_pos):
                 labels[i] = input_ids[i]
+
+            # eos token 也要学习（如果存在且紧跟 assistant 内容）
+            if end_pos < len(input_ids) and input_ids[end_pos] == eos_id:
+                labels[end_pos] = eos_id
 
         return labels
 
