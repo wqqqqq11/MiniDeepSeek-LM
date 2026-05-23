@@ -11,6 +11,7 @@ import yaml
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+from datetime import datetime
 
 from src.models.config import ModelArgs
 from src.models.transformer_stage1 import TransformerStage1
@@ -115,9 +116,6 @@ def train_stage1(config):
     num_epochs = cfg["training"]["num_epochs"]
     grad_clip = cfg["training"]["grad_clip"]
 
-    # 最优模型跟踪
-    best_ppl = float("inf")
-
     # 早停器
     es_cfg = cfg.get("early_stopping", {})
     early_stopping = EarlyStopping(
@@ -197,28 +195,29 @@ def train_stage1(config):
         logger.log_eval(epoch + 1, val_loss, val_ppl)
         logger.log_epoch_end(epoch + 1, avg_loss, val_loss)
 
+        # 保存检查点（每轮都保存，时间戳命名）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_dir = Path(log_cfg["checkpoint_dir"])
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"checkpoint_epoch{epoch}_{timestamp}.pt"
+
+        torch.save({
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "early_stopping": early_stopping.state_dict(),
+            "val_loss": val_loss,
+            "val_ppl": val_ppl,
+        }, ckpt_path)
+        logger.logger.info(f"[SAVE] epoch {epoch} saved: {ckpt_path.name} (ppl: {val_ppl:.2f})")
+
         # 早停检查
         if early_stopping.step(val_ppl):
             logger.logger.info(f"[EarlyStop] 早停触发，ppl连续{early_stopping.counter}轮未降低")
             break
 
-        # 保存检查点（基于 PPL）
-        if val_ppl < best_ppl:
-            best_ppl = val_ppl
-            ckpt_path = Path(log_cfg["checkpoint_dir"]) / "best.pt"
-            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "early_stopping": early_stopping.state_dict(),
-                "val_loss": val_loss,
-                "val_ppl": val_ppl,
-            }, ckpt_path)
-            logger.logger.info(f"[SAVE] 新最优模型 saved (ppl: {val_ppl:.2f})")
-
-    print(f"\n训练完成！最优 PPL: {best_ppl:.2f}，日志文件: {logger.get_log_file()}")
+    print(f"\n训练完成！日志文件: {logger.get_log_file()}")
 
 
 def evaluate(model, cfg, device, vocab_size):
