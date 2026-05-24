@@ -2,7 +2,7 @@
 推理入口
 
 用法:
-    python inference.py --checkpoint checkpoints/stage1/checkpoint_epoch1_20260524_133702.pt --config configs/stage1_pretrain.yaml --temperature 0.6  --max_new_tokens 100
+    python inference.py --checkpoint checkpoints/stage1/checkpoint_epoch0_20260524_154257.pt --config configs/stage1_pretrain.yaml --temperature 0.6  --max_new_tokens 100
 """
 
 import argparse

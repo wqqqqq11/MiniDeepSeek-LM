@@ -94,6 +94,10 @@ class Generator:
         """
         生成文本。
 
+        采用标准自回归模式：
+        1. 预填充阶段：传入完整prompt，生成第一个token
+        2. 解码阶段：每次只传入最后一个token，利用KV缓存
+
         Args:
             prompt: 输入提示文本。
             max_new_tokens: 最大生成token数。
@@ -103,19 +107,25 @@ class Generator:
             str: 生成的完整文本。
         """
         input_ids = self.encode(prompt)
-        generated = list(input_ids)
-        start_pos = 0
 
-        for _ in range(max_new_tokens):
-            x = torch.tensor([generated], dtype=torch.long, device=self.device)
+        # 预填充阶段：传入完整prompt
+        x = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+        logits = self.model(x, start_pos=0)
+        next_logits = logits[0, -1, :]
+        next_token = sample(next_logits, temperature)
+
+        generated = [next_token]
+
+        # 解码阶段：每次只传最后一个token，start_pos从prompt长度开始
+        start_pos = len(input_ids)
+        for _ in range(max_new_tokens - 1):
+            x = torch.tensor([[generated[-1]]], dtype=torch.long, device=self.device)
             logits = self.model(x, start_pos=start_pos)
 
             next_logits = logits[0, -1, :]
             next_token = sample(next_logits, temperature)
 
             generated.append(next_token)
-            start_pos = len(generated) - 1
+            start_pos += 1
 
-        # 只返回新生成的部分
-        new_tokens = generated[len(input_ids):]
-        return self.decode(new_tokens)
+        return self.decode(generated)
