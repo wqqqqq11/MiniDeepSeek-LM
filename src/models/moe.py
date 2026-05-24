@@ -137,9 +137,9 @@ class Gate(nn.Module):
             weights = weights / weights.sum(dim=-1, keepdim=True)
         weights = weights * self.route_scale
 
-        # Aux-Loss-Free：动态更新偏置（无梯度）
-        with torch.no_grad():
-            self._update_bias(indices)
+        if self.training:
+            with torch.no_grad():
+                self._update_bias(indices)
 
         return weights, indices
 

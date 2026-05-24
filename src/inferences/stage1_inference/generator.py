@@ -104,15 +104,17 @@ class Generator:
         """
         input_ids = self.encode(prompt)
         generated = list(input_ids)
+        start_pos = 0
 
         for _ in range(max_new_tokens):
             x = torch.tensor([generated], dtype=torch.long, device=self.device)
-            logits = self.model(x)
+            logits = self.model(x, start_pos=start_pos)
 
             next_logits = logits[0, -1, :]
             next_token = sample(next_logits, temperature)
 
             generated.append(next_token)
+            start_pos = len(generated) - 1
 
         # 只返回新生成的部分
         new_tokens = generated[len(input_ids):]
