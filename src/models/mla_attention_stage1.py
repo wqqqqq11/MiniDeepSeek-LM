@@ -355,33 +355,44 @@ class MLAStage1(nn.Module):
 
     def _init_kv_proj(self, args: ModelArgs):
         """初始化 KV 投影层。"""
-        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.kv_norm = RMSNorm(self.head_dim, args.norm_eps)
+        self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
+        self.wv = nn.Linear(self.dim, self.v_head_dim, bias=False)
 
     def _init_caches(self, args: ModelArgs):
         """初始化 KV 缓存：所有层都有窗口缓存，按需分配压缩缓存。"""
         self.register_buffer(
-            "kv_cache",
+            "k_cache",
             torch.zeros(args.max_batch_size, self.window_size, self.head_dim),
+            persistent=False
+        )
+        self.register_buffer(
+            "v_cache",
+            torch.zeros(args.max_batch_size, self.window_size, self.v_head_dim),
             persistent=False
         )
 
         if self.compress_ratio > 0:
             max_cache_len = args.max_seq_len // self.compress_ratio
             self.register_buffer(
-                "kv_compress_cache",
+                "k_compress_cache",
                 torch.zeros(args.max_batch_size, max_cache_len, self.head_dim),
+                persistent=False
+            )
+            self.register_buffer(
+                "v_compress_cache",
+                torch.zeros(args.max_batch_size, max_cache_len, self.v_head_dim),
                 persistent=False
             )
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
 
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
-                self.indexer.kv_cache = self.kv_compress_cache
+                self.indexer.kv_cache = self.k_compress_cache
             else:
                 self.indexer = None
         else:
-            self.kv_compress_cache = None
+            self.k_compress_cache = None
+            self.v_compress_cache = None
             self.compressor = None
             self.indexer = None
 
@@ -460,15 +471,15 @@ class MLAStage1(nn.Module):
         q[..., -rd:] = apply_rotary_emb(q[..., -rd:], freqs_cis)
 
         # KV 投影
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        k = self.wk(x)
+        v = self.wv(x)
 
-        # 应用 RoPE 到 KV - 原地更新
-        kv[..., -rd:] = apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        # 应用 RoPE 到 K - 原地更新
+        k[..., -rd:] = apply_rotary_emb(k[..., -rd:], freqs_cis)
 
         # 延迟绑定压缩缓存（首次调用时）
         if self.compressor is not None and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_compress_cache
+            self.compressor.kv_cache = self.k_compress_cache
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
@@ -479,10 +490,10 @@ class MLAStage1(nn.Module):
             topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
 
             if self.compress_ratio > 0:
-                kv_compress = self.compressor(x, start_pos)
+                k_compress = self.compressor(x, start_pos)
 
                 if self.indexer is not None:
-                    offset = kv.size(1)
+                    offset = k.size(1)
                     with torch.no_grad():
                         compress_idxs = self.indexer(x, qr, start_pos, offset, x.device)
                         topk_idxs = torch.cat([
@@ -490,25 +501,31 @@ class MLAStage1(nn.Module):
                             compress_idxs
                         ], dim=-1).long()
 
-                if kv_compress is not None:
-                    kv = torch.cat([kv, kv_compress], dim=1)
+                if k_compress is not None:
+                    v_compress = k_compress[..., :self.v_head_dim]
+                    k = torch.cat([k, k_compress], dim=1)
+                    v = torch.cat([v, v_compress], dim=1)
 
-            kv_len = kv.size(1)
+            kv_len = k.size(1)
             if kv_len <= win:
-                self.kv_cache[:bsz, :kv_len] = kv.detach() if not self.training else kv
+                self.k_cache[:bsz, :kv_len] = k.detach() if not self.training else k
+                self.v_cache[:bsz, :kv_len] = v.detach() if not self.training else v
             else:
                 cutoff = kv_len % win
-                win_kv = kv[:, -win:]
-                win_kv = win_kv.detach() if not self.training else win_kv
-                self.kv_cache[:bsz, cutoff:win], self.kv_cache[:bsz, :cutoff] = win_kv.split([win - cutoff, cutoff], dim=1)
+                win_k = k[:, -win:]
+                win_v = v[:, -win:]
+                win_k = win_k.detach() if not self.training else win_k
+                win_v = win_v.detach() if not self.training else win_v
+                self.k_cache[:bsz, cutoff:win], self.k_cache[:bsz, :cutoff] = win_k.split([win - cutoff, cutoff], dim=1)
+                self.v_cache[:bsz, cutoff:win], self.v_cache[:bsz, :cutoff] = win_v.split([win - cutoff, cutoff], dim=1)
 
-            o = self._sparse_attn(q, kv, topk_idxs)
+            o = self._sparse_attn(q, k, v, topk_idxs)
         else:
             with torch.no_grad():
                 topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, x.device)
 
             if self.compress_ratio > 0:
-                self.compressor(x, start_pos)
+                k_compress = self.compressor(x, start_pos)
 
                 with torch.no_grad():
                     offset = win
@@ -521,15 +538,21 @@ class MLAStage1(nn.Module):
                     topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1).long()
 
                 n_compress = (start_pos + 1) // self.compress_ratio
-                attn_kv = torch.cat([
-                    self.kv_cache[:bsz],
-                    self.kv_compress_cache[:bsz, :n_compress]
+                attn_k = torch.cat([
+                    self.k_cache[:bsz],
+                    self.k_compress_cache[:bsz, :n_compress]
+                ], dim=1)
+                attn_v = torch.cat([
+                    self.v_cache[:bsz],
+                    self.v_compress_cache[:bsz, :n_compress]
                 ], dim=1)
             else:
-                attn_kv = self.kv_cache[:bsz]
+                attn_k = self.k_cache[:bsz]
+                attn_v = self.v_cache[:bsz]
 
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
-            o = self._sparse_attn(q, attn_kv, topk_idxs)
+            self.k_cache[:bsz, start_pos % win] = k.squeeze(1)
+            self.v_cache[:bsz, start_pos % win] = v.squeeze(1)
+            o = self._sparse_attn(q, attn_k, attn_v, topk_idxs)
 
         return self.wo(o.reshape(bsz, seqlen, -1))
 
@@ -540,28 +563,28 @@ class MLAStage1(nn.Module):
         scores[..., 0] += self.attn_sink
         return scores
 
-    def _sparse_attn(self, q: Tensor, kv: Tensor, indices: Tensor) -> Tensor:
+    def _sparse_attn(self, q: Tensor, k: Tensor, v: Tensor, indices: Tensor) -> Tensor:
         """计算稀疏注意力 - 优化版：单次 matmul，合并 nope+rope 计算。"""
-        bsz, seqlen, k = indices.size()
+        bsz, seqlen, k_len = indices.size()
 
-        # gather 稀疏 KV: [b, s*k, head_dim]
         safe_indices = indices.clamp(min=0)
-        flat_idx = safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim)
-        k_sparse = kv.gather(1, flat_idx).view(bsz, seqlen, k, self.head_dim)
-        v_sparse = k_sparse[..., :self.v_head_dim]
 
-        # 单次 matmul：q[b,s,h,d] × k[b,s,k,d]ᵀ → [b,s,h,k]
+        flat_k_idx = safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.head_dim)
+        k_sparse = k.gather(1, flat_k_idx).view(bsz, seqlen, k_len, self.head_dim)
+
+        flat_v_idx = safe_indices.view(bsz, -1).unsqueeze(-1).expand(-1, -1, self.v_head_dim)
+        v_sparse = v.gather(1, flat_v_idx).view(bsz, seqlen, k_len, self.v_head_dim)
+
         scores = torch.matmul(q, k_sparse.transpose(-2, -1)) * self.softmax_scale
         scores = self._apply_attn_sink(scores)
         scores.masked_fill_(indices.unsqueeze(2) < 0, float("-inf"))
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
-        # einsum 聚合，允许编译器融合
         return torch.einsum("bshk,bskd->bshd", scores, v_sparse)
 
     def get_kv_cache_size(self) -> int:
         """获取 KV 缓存大小（以元素计）。"""
-        total = self.kv_cache.numel()
-        if self.kv_compress_cache is not None:
-            total += self.kv_compress_cache.numel()
+        total = self.k_cache.numel() + self.v_cache.numel()
+        if self.k_compress_cache is not None:
+            total += self.k_compress_cache.numel() + self.v_compress_cache.numel()
         return total
