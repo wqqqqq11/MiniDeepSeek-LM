@@ -64,9 +64,8 @@ class BlockStage1(nn.Module):
         if args.hc_mult > 1:
             mix_hc = (2 + args.hc_mult) * args.hc_mult
             hc_dim = args.hc_mult * args.dim
+
             _init_hc_params(self, mix_hc, hc_dim)
-            _init_hc_params(self, mix_hc, hc_dim)
-            # 重命名以区分 attn/mlp
             self.hc_attn_fn = self.hc_fn
             self.hc_attn_base = self.hc_base
             self.hc_attn_scale = self.hc_scale
