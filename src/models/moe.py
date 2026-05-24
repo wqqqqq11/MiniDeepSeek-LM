@@ -229,7 +229,10 @@ class MoE(nn.Module):
 
             idx = mask.nonzero(as_tuple=True)[0]
             expert = self.experts[i]
-            w = weights[mask].mean(dim=-1, keepdim=True)
+
+            expert_pos = (indices[mask] == i).float().argmax(dim=-1)
+            w = weights[mask].gather(1, expert_pos.unsqueeze(1))
+
             out = expert(x[mask]) * w
             expert_outs.append((idx, out))
 
