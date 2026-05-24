@@ -24,61 +24,61 @@ from .rotary_embedding import apply_rotary_emb, precompute_freqs_cis
 
 
 class Compressor(nn.Module):
-    """KV 缓存压缩器 - 门控池化压缩为低频表示。"""
+    """K 或 V 缓存压缩器 - 门控池化压缩为低频表示。"""
 
-    def __init__(self, args: ModelArgs, compress_ratio: int, head_dim: int):
+    def __init__(self, args: ModelArgs, compress_ratio: int, feature_dim: int, is_v: bool = False):
         super().__init__()
         self.dim = args.dim
-        self.head_dim = head_dim
-        self.rope_head_dim = args.qk_rope_head_dim
-        self.nope_head_dim = head_dim - args.qk_rope_head_dim
+        self.feature_dim = feature_dim
         self.compress_ratio = compress_ratio
-        self.overlap = compress_ratio == 4
+        self.is_v = is_v
+        # V 不需要 overlap，K 需要 overlap 保持时序连贯性
+        self.overlap = (compress_ratio == 4) and not is_v
 
         coff = 1 + self.overlap
-        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim))
+        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * feature_dim))
         nn.init.normal_(self.ape, mean=0.0, std=0.02)
 
-        self.wkv = nn.Linear(self.dim, coff * head_dim, bias=False)
-        self.wgate = nn.Linear(self.dim, coff * head_dim, bias=False)
-        self.norm = RMSNorm(head_dim, args.norm_eps)
+        self.w = nn.Linear(feature_dim, coff * feature_dim, bias=False)
+        self.wgate = nn.Linear(feature_dim, coff * feature_dim, bias=False)
+        self.norm = RMSNorm(feature_dim, args.norm_eps)
 
-        self.kv_cache: Optional[Tensor] = None
+        self.compress_cache: Optional[Tensor] = None
         self.freqs_cis: Optional[Tensor] = None
+        self.rope_head_dim: int = 0  # 由外部设置（K compressor）
 
         max_bsz = args.max_batch_size
         state_len = coff * compress_ratio
         self.register_buffer(
-            "kv_state",
-            torch.zeros(max_bsz, state_len, coff * head_dim),
+            "state",
+            torch.zeros(max_bsz, state_len, coff * feature_dim),
             persistent=False
         )
         self.register_buffer(
             "score_state",
-            torch.full((max_bsz, state_len, coff * head_dim), float("-inf")),
+            torch.full((max_bsz, state_len, coff * feature_dim), float("-inf")),
             persistent=False
         )
 
         if self.overlap:
             max_groups = args.max_seq_len // compress_ratio
             self.register_buffer(
-                "_ol_kv",
-                torch.zeros(max_bsz, max_groups, 2 * compress_ratio, head_dim),
+                "_ol",
+                torch.zeros(max_bsz, max_groups, 2 * compress_ratio, feature_dim),
                 persistent=False,
             )
             self.register_buffer(
                 "_ol_score",
-                torch.full((max_bsz, max_groups, 2 * compress_ratio, head_dim), float("-inf")),
+                torch.full((max_bsz, max_groups, 2 * compress_ratio, feature_dim), float("-inf")),
                 persistent=False,
             )
 
     def overlap_transform(self, tensor: Tensor, is_score: bool = False) -> Tensor:
         """重叠窗口变换，训练时可微，推理时高效。"""
-        ratio, d = self.compress_ratio, self.head_dim
+        ratio, d = self.compress_ratio, self.feature_dim
         pad_value = float("-inf") if is_score else 0
         groups = tensor.size(1)
 
-        # groups < 2 时无法做 overlap shift，但仍需 reshape
         if self.training or groups < 2:
             cur = tensor[..., d:]
             prev = tensor[..., :d]
@@ -87,14 +87,13 @@ class Compressor(nn.Module):
                 first = torch.full_like(prev[:, :1], pad_value)
                 prev_shift = torch.cat([first, prev[:, :-1]], dim=1)
             else:
-                # groups == 1，没有前一个 group 可 shift，用全 pad
                 prev_shift = torch.full_like(prev, pad_value)
 
             return torch.cat([prev_shift, cur], dim=2)
 
         b, s, _, _ = tensor.size()
         with torch.no_grad():
-            buf = self._ol_score[:b, :s] if is_score else self._ol_kv[:b, :s]
+            buf = self._ol_score[:b, :s] if is_score else self._ol[:b, :s]
             buf[:, :, ratio:].copy_(tensor[..., d:])
             if s > 1:
                 buf[:, 1:, :ratio].copy_(tensor[:, :-1, :, :d])
@@ -104,7 +103,7 @@ class Compressor(nn.Module):
     def _compress_prefill(self, x: Tensor, seqlen: int, bsz: int) -> Tuple[Optional[Tensor], bool, int]:
         """预填充阶段压缩。"""
         ratio = self.compress_ratio
-        kv = self.wkv(x)
+        feat = self.w(x)
         score = self.wgate(x)
 
         should_compress = seqlen >= ratio
@@ -115,96 +114,100 @@ class Compressor(nn.Module):
         maybe_detach = lambda t: t.detach() if not self.training else t
 
         if self.overlap and cutoff >= ratio:
-            self.kv_state[:bsz, :ratio] = maybe_detach(kv[:, cutoff - ratio:cutoff])
+            self.state[:bsz, :ratio] = maybe_detach(feat[:, cutoff - ratio:cutoff])
             self.score_state[:bsz, :ratio] = maybe_detach(score[:, cutoff - ratio:cutoff] + self.ape[:ratio])
 
         if remainder > 0:
-            remainder_kv = kv[:, cutoff:]
-            kv = kv[:, :cutoff]
-            self.kv_state[:bsz, offset:offset + remainder] = maybe_detach(remainder_kv)
+            remainder_feat = feat[:, cutoff:]
+            feat = feat[:, :cutoff]
+            self.state[:bsz, offset:offset + remainder] = maybe_detach(remainder_feat)
             self.score_state[:bsz, offset:offset + remainder] = maybe_detach(score[:, cutoff:] + self.ape[:remainder])
             score = score[:, :cutoff]
 
-        kv = kv.unflatten(1, (-1, ratio))
+        feat = feat.unflatten(1, (-1, ratio))
         score = score.unflatten(1, (-1, ratio)) + self.ape
 
-        if self.overlap and kv.size(1) > 0:
-            kv = self.overlap_transform(kv, is_score=False)
+        if self.overlap and feat.size(1) > 0:
+            feat = self.overlap_transform(feat, is_score=False)
             score = self.overlap_transform(score, is_score=True)
 
-        kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        feat = (feat * score.softmax(dim=2)).sum(dim=2)
 
-        return kv, should_compress, cutoff
+        return feat, should_compress, cutoff
 
     def _compress_decode(self, x: Tensor, start_pos: int, bsz: int) -> Tuple[Optional[Tensor], bool]:
         """解码阶段压缩。"""
         ratio = self.compress_ratio
-        kv = self.wkv(x)
+        feat = self.w(x)
         score = self.wgate(x) + self.ape[start_pos % ratio]
 
         should_compress = (start_pos + 1) % ratio == 0
         maybe_detach = lambda t: t.detach() if not self.training else t
 
         if self.overlap:
-            self.kv_state[:bsz, ratio + start_pos % ratio] = maybe_detach(kv.squeeze(1))
+            d = self.feature_dim
+            self.state[:bsz, ratio + start_pos % ratio] = maybe_detach(feat.squeeze(1))
             self.score_state[:bsz, ratio + start_pos % ratio] = maybe_detach(score.squeeze(1))
 
             if should_compress:
-                kv_state = torch.cat([
-                    self.kv_state[:bsz, :ratio, :self.head_dim],
-                    self.kv_state[:bsz, ratio:, self.head_dim:]
+                feat_state = torch.cat([
+                    self.state[:bsz, :ratio, :d],
+                    self.state[:bsz, ratio:, d:]
                 ], dim=1)
                 score_state = torch.cat([
-                    self.score_state[:bsz, :ratio, :self.head_dim],
-                    self.score_state[:bsz, ratio:, self.head_dim:]
+                    self.score_state[:bsz, :ratio, :d],
+                    self.score_state[:bsz, ratio:, d:]
                 ], dim=1)
-                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                self.kv_state[:bsz, :ratio] = maybe_detach(self.kv_state[:bsz, ratio:])
+                feat = (feat_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                self.state[:bsz, :ratio] = maybe_detach(self.state[:bsz, ratio:])
                 self.score_state[:bsz, :ratio] = maybe_detach(self.score_state[:bsz, ratio:])
         else:
-            self.kv_state[:bsz, start_pos % ratio] = maybe_detach(kv.squeeze(1))
+            self.state[:bsz, start_pos % ratio] = maybe_detach(feat.squeeze(1))
             self.score_state[:bsz, start_pos % ratio] = maybe_detach(score.squeeze(1))
 
             if should_compress:
-                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
+                feat = (self.state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
 
-        return kv, should_compress
+        return feat, should_compress
 
     def forward(self, x: Tensor, start_pos: int) -> Optional[Tensor]:
         """前向压缩，未达到压缩条件时返回 None。"""
-        assert self.kv_cache is not None
+        assert self.compress_cache is not None
 
         bsz, seqlen, _ = x.size()
-        rd = self.rope_head_dim
 
         if start_pos == 0:
-            kv, should_compress, cutoff = self._compress_prefill(x, seqlen, bsz)
+            feat, should_compress, cutoff = self._compress_prefill(x, seqlen, bsz)
         else:
-            kv, should_compress = self._compress_decode(x, start_pos, bsz)
+            feat, should_compress = self._compress_decode(x, start_pos, bsz)
             cutoff = 0
 
-        if not should_compress or kv is None:
+        if not should_compress or feat is None:
             return None
 
-        kv = self.norm(kv)
+        feat = self.norm(feat)
 
-        if start_pos == 0:
-            freqs_cis = self.freqs_cis[:cutoff:self.compress_ratio]
-        else:
-            freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
+        # K 需要应用 RoPE，V 不需要
+        if not self.is_v:
+            rd = self.rope_head_dim if hasattr(self, 'rope_head_dim') else 0
+            if rd > 0:
+                if start_pos == 0:
+                    freqs_cis = self.freqs_cis[:cutoff:self.compress_ratio]
+                else:
+                    freqs_cis = self.freqs_cis[start_pos + 1 - self.compress_ratio].unsqueeze(0)
 
-        if freqs_cis.device != kv.device:
-            freqs_cis = freqs_cis.to(kv.device)
+                if freqs_cis.device != feat.device:
+                    freqs_cis = freqs_cis.to(feat.device)
 
-        kv = torch.cat([kv[..., :-rd], apply_rotary_emb(kv[..., -rd:], freqs_cis)], dim=-1)
+                feat = torch.cat([feat[..., :-rd], apply_rotary_emb(feat[..., -rd:], freqs_cis)], dim=-1)
 
         with torch.no_grad():
             if start_pos == 0:
-                self.kv_cache[:bsz, :seqlen // self.compress_ratio, :kv.size(-1)].copy_(kv)
+                self.compress_cache[:bsz, :seqlen // self.compress_ratio, :feat.size(-1)].copy_(feat)
             else:
-                self.kv_cache[:bsz, start_pos // self.compress_ratio, :kv.size(-1)].copy_(kv.squeeze(1))
+                self.compress_cache[:bsz, start_pos // self.compress_ratio, :feat.size(-1)].copy_(feat.squeeze(1))
 
-        return kv
+        return feat
 
 
 class Indexer(nn.Module):
@@ -383,7 +386,10 @@ class MLAStage1(nn.Module):
                 torch.zeros(args.max_batch_size, max_cache_len, self.v_head_dim),
                 persistent=False
             )
-            self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
+            # K 压缩器（需要 RoPE）
+            self.k_compressor = Compressor(args, self.compress_ratio, self.head_dim, is_v=False)
+            # V 压缩器（不需要 RoPE）
+            self.v_compressor = Compressor(args, self.compress_ratio, self.v_head_dim, is_v=True)
 
             if self.compress_ratio == 4:
                 self.indexer = Indexer(args, self.compress_ratio)
@@ -393,7 +399,8 @@ class MLAStage1(nn.Module):
         else:
             self.k_compress_cache = None
             self.v_compress_cache = None
-            self.compressor = None
+            self.k_compressor = None
+            self.v_compressor = None
             self.indexer = None
 
     def _init_rope(self, args: ModelArgs):
@@ -409,8 +416,9 @@ class MLAStage1(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
-        if self.compressor is not None:
-            self.compressor.freqs_cis = self.freqs_cis
+        if self.k_compressor is not None:
+            self.k_compressor.freqs_cis = self.freqs_cis
+            self.k_compressor.rope_head_dim = self.rope_head_dim
         if self.indexer is not None:
             self.indexer.freqs_cis = self.freqs_cis
 
@@ -474,15 +482,17 @@ class MLAStage1(nn.Module):
         k = self.wk(x)
         v = self.wv(x)
 
-        # 应用 RoPE 到 K - 原地更新
+        # 应用 RoPE 到 K 和 V 的后 rd 维 - 原地更新
         k[..., -rd:] = apply_rotary_emb(k[..., -rd:], freqs_cis)
+        v[..., -rd:] = apply_rotary_emb(v[..., -rd:], freqs_cis)
 
         # 延迟绑定压缩缓存（首次调用时）
-        if self.compressor is not None and self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.k_compress_cache
-            self.compressor.freqs_cis = self.freqs_cis
-            if self.indexer is not None:
-                self.indexer.freqs_cis = self.freqs_cis
+        if self.k_compressor is not None and self.k_compressor.compress_cache is None:
+            self.k_compressor.compress_cache = self.k_compress_cache
+            self.k_compressor.freqs_cis = self.freqs_cis
+            self.k_compressor.rope_head_dim = self.rope_head_dim
+        if self.v_compressor is not None and self.v_compressor.compress_cache is None:
+            self.v_compressor.compress_cache = self.v_compress_cache
 
         # 先生成窗口索引，再更新压缩缓存，最后生成压缩索引
         # 保证 indexer 看到的是包含当前 step 的最新缓存
@@ -490,7 +500,8 @@ class MLAStage1(nn.Module):
             topk_idxs = self._get_train_indices(bsz, seqlen, x.device)
 
             if self.compress_ratio > 0:
-                k_compress = self.compressor(x, start_pos)
+                k_compress = self.k_compressor(k, start_pos)
+                v_compress = self.v_compressor(v, start_pos)
 
                 if self.indexer is not None:
                     offset = k.size(1)
@@ -501,8 +512,7 @@ class MLAStage1(nn.Module):
                             compress_idxs
                         ], dim=-1).long()
 
-                if k_compress is not None:
-                    v_compress = k_compress[..., :self.v_head_dim]
+                if k_compress is not None and v_compress is not None:
                     k = torch.cat([k, k_compress], dim=1)
                     v = torch.cat([v, v_compress], dim=1)
 
@@ -519,13 +529,14 @@ class MLAStage1(nn.Module):
                 self.k_cache[:bsz, cutoff:win], self.k_cache[:bsz, :cutoff] = win_k.split([win - cutoff, cutoff], dim=1)
                 self.v_cache[:bsz, cutoff:win], self.v_cache[:bsz, :cutoff] = win_v.split([win - cutoff, cutoff], dim=1)
 
-            o = self._sparse_attn(q, k, v, topk_idxs)
+            o = self._sparse_attn(q, k, v, topk_idxs, freqs_cis)
         else:
             with torch.no_grad():
                 topk_idxs = get_window_indices(win, bsz, seqlen, start_pos, x.device)
 
             if self.compress_ratio > 0:
-                k_compress = self.compressor(x, start_pos)
+                self.k_compressor(k, start_pos)
+                self.v_compressor(v, start_pos)
 
                 with torch.no_grad():
                     offset = win
@@ -552,7 +563,7 @@ class MLAStage1(nn.Module):
 
             self.k_cache[:bsz, start_pos % win] = k.squeeze(1)
             self.v_cache[:bsz, start_pos % win] = v.squeeze(1)
-            o = self._sparse_attn(q, attn_k, attn_v, topk_idxs)
+            o = self._sparse_attn(q, attn_k, attn_v, topk_idxs, freqs_cis)
 
         return self.wo(o.reshape(bsz, seqlen, -1))
 
@@ -563,9 +574,10 @@ class MLAStage1(nn.Module):
         scores[..., 0] += self.attn_sink
         return scores
 
-    def _sparse_attn(self, q: Tensor, k: Tensor, v: Tensor, indices: Tensor) -> Tensor:
-        """计算稀疏注意力 - 优化版：单次 matmul，合并 nope+rope 计算。"""
+    def _sparse_attn(self, q: Tensor, k: Tensor, v: Tensor, indices: Tensor, freqs_cis: Tensor) -> Tensor:
+        """计算稀疏注意力 - 优化版：单次 matmul，合并 nope+rope 计算，含反向 RoPE。"""
         bsz, seqlen, k_len = indices.size()
+        rd = self.rope_head_dim
 
         safe_indices = indices.clamp(min=0)
 
@@ -580,7 +592,13 @@ class MLAStage1(nn.Module):
         scores.masked_fill_(indices.unsqueeze(2) < 0, float("-inf"))
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(q)
 
-        return torch.einsum("bshk,bskd->bshd", scores, v_sparse)
+        out = torch.einsum("bshk,bskd->bshd", scores, v_sparse)
+
+        # 反向 RoPE：抵消绝对位置，保留相对位置信息
+        if rd > 0:
+            out[..., -rd:] = apply_rotary_emb(out[..., -rd:], freqs_cis, inverse=True)
+
+        return out
 
     def get_kv_cache_size(self) -> int:
         """获取 KV 缓存大小（以元素计）。"""
