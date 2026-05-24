@@ -187,6 +187,9 @@ def train_stage1(config):
             }
             logger.log_train(step, steps_per_epoch, metrics)
 
+            # 重置计时器
+            step_start_time = time.time()
+
         # 计算 epoch 平均损失
         avg_loss = epoch_loss / actual_steps
 
