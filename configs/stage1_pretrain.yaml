@@ -31,7 +31,7 @@ model:
   ema_decay: 0.9               # 频率统计滑动平均衰减率
   
   # 序列配置
-  max_seq_len: 1024            # 阶段1序列长度
+  max_seq_len: 256            # 阶段1序列长度
   original_seq_len: 4096        # RoPE 基准长度
   
   # RoPE 配置
@@ -46,8 +46,8 @@ model:
   # 稀疏注意力配置 (CSA/HCA)
   attn_patterns: [0, 1, 0, 1, 0, 1, 0, 1]     # 交替 HCA(0)/CSA(1)
   compress_ratios: [4, 2, 4, 2, 4, 2, 4, 2]  # HCA=4, CSA=2
-  index_topk: 1024                              # CSA 检索 Top-k 数量
-  window_size: 128                             # CSA 滑动窗口大小
+  index_topk: 64                              # CSA 检索 Top-k 数量
+  window_size: 32                             # CSA 滑动窗口大小
   hc_mult: 2                                   # 不使用 Hyper-Connections
   
   # 权重共享
@@ -61,7 +61,7 @@ mtp:
 
 # 训练参数
 training:
-  num_epochs: 45                 # 总训练轮数
+  num_epochs: 60                 # 总训练轮数
   batch_size: 32                 # 批次大小
   gradient_accumulation: 1      # 梯度累积步数
   
@@ -107,7 +107,7 @@ precision:
 data:
   train_bin: "datasets/stage_1_datasets/6_binarize/train.bin"
   val_bin: "datasets/stage_1_datasets/6_binarize/val.bin"
-  context_size: 1024
+  context_size: 256
   shuffle_seed: 42
 
 # 日志与检查点
@@ -136,7 +136,7 @@ hardware:
 
 # 阶段3 SFT配置
 sft:
-  base_checkpoint: "checkpoints/stage1/checkpoint_epoch0_20260523_184731.pt"
+  base_checkpoint: "checkpoints/stage1/checkpoint_epoch0_20260524_154257.pt"
   domains:
     math:
       expert_id: 0
