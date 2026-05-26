@@ -12,7 +12,6 @@
 | ---- | -------: | ----------------------- |
 | 数学推理 | expert 0 | 解题、推理、公式推导、最终答案生成       |
 | 代码生成 | expert 1 | 代码生成、代码解释、简单调试、测试用例理解   |
-| 科研学术 | expert 2 | 科研文本理解、论文摘要、证据判断、科学事实核查 |
 
 阶段 3 的核心原则：
 
@@ -36,29 +35,12 @@ stage2 base model
 
 阶段 3 需要完成以下工作：
 
-1. 准备数学、代码、科研 3 个领域的 SFT 数据。
-2. 准备数学、代码、科研 3 个领域的 GRPO prompt pool。
+1. 准备数学、代码 2 个领域的 SFT 数据。
+2. 准备数学、代码 2 个领域的 GRPO prompt pool。
 3. 明确区分单轮和多轮数据。
-4. 从阶段 2 checkpoint 出发，分别训练 3 个领域专家。
+4. 从阶段 2 checkpoint 出发，分别训练 2 个领域专家。
 5. 每个专家先做 SFT，再做 GRPO。
-6. 训练结束后产出 3 个专家 checkpoint，供阶段 4 OPD 蒸馏合并使用。
-
----
-
-## 3. 阶段 3 数据规模设计
-
-阶段 3 总数据量：6M tokens。
-
-每个领域 2M tokens：
-
-| 领域   | 总 Token | SFT Token | GRPO Token |
-| ---- | ------: | --------: | ---------: |
-| 数学推理 |      2M |      1.8M |       0.2M |
-| 代码生成 |      2M |      1.8M |       0.2M |
-| 科研学术 |      2M |      1.8M |       0.2M |
-| 合计   |      6M |      5.4M |       0.6M |
-
-注意：这里的 GRPO Token 不是指标准答案 token，而是指 GRPO 训练中 prompt、生成结果和优化过程中消耗的近似 token budget。
+6. 训练结束后产出 2 个专家 checkpoint，供阶段 4 OPD 蒸馏合并使用。
 
 ---
 
@@ -73,19 +55,16 @@ SFT 数据：
 | AI-MO/NuminaMath-CoT   | 100% | 1.8M |
 样本展示：
 source（不需要）  problem（需要）   solution（需要）    messages（不需要）
-synthetic_math  Suppose that $g(x) = 5x - 3$. What is $g^{-1}(g^{-1}(14))$? First, we need to find the inverse function $g^{-1}(x)$. G...   [
-{
-"content": "Suppose that $g(x) = 5x - 3$. What is $g^{-1}(g^{-1}(14))$?",
-"role": "user"
-},
-{
-"content": "First, we need to find the inverse function $g^{...
 
 GRPO 数据：
 
 | 数据集          |   占比 | 用途           |
 | ------------ | ---: | ------------ |
 | openai/gsm8k | 100% | 最终答案可验证的数学推理 |
+
+样本展示：
+question（需要）    answer（需要）
+
 
 ### 4.2 代码专家
 
@@ -99,42 +78,18 @@ SFT 数据：
 样本展示：
 ise-uiuc/Magicoder-OSS-Instruct-75K：
 lang（不需要）  raw_index（不需要）   index（不需要）   seed（不需要）    openai_fingerprint（不需要）    problem（需要）   solution（需要）
-cpp   101,533   4,626   int n;
-cin >> n;
-vector<int> a(n + 1), b(n + 1);...    fp_eeff13170a   You are given two arrays, A and B, each of length n. You need to perform a convolution...   ```cpp
-#include <iostream>
-#include <vector>
-using namespace std;
-
-vector<int> convolution(vector<int> a, vector<int> b) {...
 
 m-a-p/CodeFeedback-Filtered-Instruction：
 query（需要）     answer（需要）      resource（不需要）      lang（不需要）
-Create a nested loop to print every combination of numbers between 0-9,...      Here is an example of a nested loop in Python to print every combination of numbers...      evolinstruct      python
+
 GRPO 数据：
 
 | 数据集             |   占比 | 用途            |
 | --------------- | ---: | ------------- |
 | codeparrot/apps | 100% | 代码生成 + 单元测试奖励 |
 
-### 4.3 科研专家
-
-SFT 数据：
-
-| 数据集              |  占比 | Token |
-| ---------------- | --: | ----: |
-| qiaojin/PubMedQA | 100% | 1.8M |
-
-样本展示：
-pubid（不需要）   question（需要）    context（不需要）     long_answer（需要）     final_decision（不需要）
-25,429,730    Are group 2 innate lymphoid cells ( ILC2s ) increased...    {
-"contexts": [
-"Chronic rhinosinusitis (CRS) is a heterogeneous disease with an uncertain pathog....     As ILC2s are elevated in patients with CRSwNP, they may drive nasal polyp formation in ...    yes
-GRPO 数据：
-
-| 数据集             |   占比 | 用途            |
-| --------------- | ---: | ------------- |
-| allenai/scifact | 100% | 科学声明验证 + 证据判断 |
+样本示例：
+'problem_id'（不需要）, 'question'（需要）, 'solutions'（需要）, 'input_output'（不需要）, 'difficulty'（不需要）, 'url'（不需要）, 'starter_code'
 
 ---
 
@@ -291,53 +246,15 @@ assistant 部分：labels = 正常 token id
 尽量保留函数级、算法题级、调试级样本
 ```
 
-科研过滤：
-
-```text
-保留有上下文、摘要、证据、问题、答案的样本
-去掉缺少证据却要求具体结论的样本
-保留不确定性表达，例如“根据给定内容无法判断”
-```
-
 ---
 
 ## 13. GRPO 数据格式
 
 GRPO 数据不使用 assistant 标准答案作为 labels。
-
-GRPO 数据需要的是：
-
-```text
-prompt
-+ 可验证答案 / 测试用例 / 标签 / 证据
-+ reward_type
-```
-
-统一格式：
-
-```json
-{
-  "id": "sample_id",
-  "domain": "math",
-  "expert_id": 0,
-  "prompt": [
-    {
-      "role": "system",
-      "content": "你是数学推理专家。请逐步推理，并在最后给出答案。"
-    },
-    {
-      "role": "user",
-      "content": "..."
-    }
-  ],
-  "reward_type": "math_exact",
-  "answer": "..."
-}
-```
-
 ---
 
 ## 14. GRPO 数据示例
+### 数学专家 (expert_id: 0)
 ```json
 {
   "id": "gsm8k_000001",
@@ -354,10 +271,115 @@ prompt
       "content": "Janet has 3 apples and buys 5 more. How many apples does she have?"
     }
   ],
-  "answer": "8",
-  "reward_type": "math_exact"
+  "reward_type": "math_exact",
+  "reward_meta": {
+    "answer": "8"
+  }
 }
+
+打分依据：
+答案正确性
 ```
+
+### 代码专家 (expert_id: 1)
+
+```json
+{
+  "id": "apps_000001",
+  "domain": "code",
+  "expert_id": 1,
+  "source": "codeparrot/apps",
+  "prompt": [
+    {
+      "role": "system",
+      "content": "你是代码生成专家。请编写解决以下问题的Python代码，只输出代码，不需要解释。"
+    },
+    {
+      "role": "user",
+      "content": "编写一个函数计算两个数的最大公约数。"
+    }
+  ],
+  "reward_type": "unit_test",
+  "reward_meta": {
+    "test_cases": [
+      {
+        "input": "gcd(12, 8)",
+        "expected_output": "4"
+      },
+      {
+        "input": "gcd(17, 13)",
+        "expected_output": "1"
+      },
+      {
+        "input": "gcd(100, 25)",
+        "expected_output": "25"
+      }
+    ],
+    "language": "python",
+    "time_limit": 2.0
+  }
+}
+
+示例：
+# 模型生成的代码（字符串）
+generated_code = '''
+def gcd(a, b):
+    while b:
+        a, b = b, a % b
+    return a
+'''
+
+# 数据中的测试用例
+test_cases = [
+    {"input": "gcd(12, 8)", "expected_output": "4"},
+    {"input": "gcd(17, 13)", "expected_output": "1"}
+]
+
+# 奖励函数执行流程
+def code_reward_single(generated_code, test_cases):
+    score = 0
+    
+    # 1. 执行代码字符串，定义函数
+    local_env = {}
+    try:
+        exec(generated_code, {}, local_env)
+    except SyntaxError:
+        return 0.0  # 语法错误，0分
+    
+    # 2. 执行测试
+    for test in test_cases:
+        try:
+            # eval("gcd(12, 8)") → 调用函数，返回 4
+            actual_output = eval(test["input"], {}, local_env)
+            
+            if str(actual_output) == test["expected_output"]:
+                score += 1 / len(test_cases)  # 通过，加分
+        except Exception as e:
+            pass  # 执行出错，不得分
+    
+    return score
+
+# 运行
+reward = code_reward_single(generated_code, test_cases)
+print(reward)  # 输出: 1.0 (全部通过)
+
+打分依据：
+答案正确性
+耗时
+```
+
+### 字段说明
+
+| 字段 | 说明 |
+|------|------|
+| `reward_type` | 奖励函数类型，决定使用哪个 reward_fn |
+| `reward_meta` | 奖励函数打分所需的验证信息，各字段含义因领域而异 |
+
+各 `reward_meta` 字段详细说明：
+
+- **数学**: `answer` - 标准答案，用于 exact match 验证
+- **代码**: `test_cases` - 测试用例列表；`language` - 编程语言；`time_limit` - 执行超时限制
+
 ---
 
 ## 15. 是否需要 LoRA
@@ -386,13 +408,12 @@ prompt
 
 ### 16.1 专家分配
 
-假设模型有 3 个 routed experts：
+假设模型有 2 个 routed experts：
 
 | expert_id | 用途        |
 | --------: | --------- |
 |         0 | 数学专家      |
 |         1 | 代码专家      |
-|         2 | 科研专家      |
 
 shared expert 保持冻结。
 
@@ -430,9 +451,6 @@ model(input_ids, labels=labels, force_expert_id=0)
 
 # 代码
 model(input_ids, labels=labels, force_expert_id=1)
-
-# 科研
-model(input_ids, labels=labels, force_expert_id=2)
 ```
 
 ---
@@ -472,14 +490,6 @@ freeze_all(model)
 unfreeze_domain_expert(model, expert_id=1)
 ```
 
-训练科研专家：
-
-```python
-model = load_checkpoint("checkpoints/stage2/base.pt")
-freeze_all(model)
-unfreeze_domain_expert(model, expert_id=2)
-```
-
 注意：每个领域都应该从同一个 stage2 base checkpoint 开始，而不是串行训练。
 
 ## 18. SFT 训练流程
@@ -511,18 +521,6 @@ unfreeze_domain_expert(model, expert_id=2)
 → 保存 code_sft.pt
 ```
 
-科研专家：
-
-```text
-加载 stage2 base checkpoint
-→ 冻结全部参数
-→ 解冻 expert 2
-→ 加载 science SFT 数据
-→ force_expert_id = 2
-→ 更新 expert 2
-→ 保存 science_sft.pt
-```
-
 ---
 
 ## 19. GRPO 训练流程
@@ -537,7 +535,7 @@ GRPO 在 SFT 基础上进一步强化可验证能力：
 | -- | ------------ |
 | 数学 | 最终答案正确率      |
 | 代码 | 单元测试通过率      |
-| 科研 | 标签判断和证据使用正确率 |
+
 
 ### 19.2 GRPO 基本思想
 
@@ -568,7 +566,6 @@ A_i = (r_i - mean(r)) / (std(r) + eps)
 ```text
 math_sft.pt → math_grpo.pt
 code_sft.pt → code_grpo.pt
-science_sft.pt → science_grpo.pt
 ```
 
 其中：
@@ -590,9 +587,7 @@ reference_model = 该领域 SFT 后的冻结模型
 
 ```text
 最终答案正确：+1.0
-格式正确：+0.1
 没有最终答案：-0.2
-明显胡乱输出：-0.5
 输出过长：-0.05 ~ -0.2
 ```
 
@@ -620,9 +615,6 @@ def math_reward(completions, answer, **kwargs):
         rewards.append(score)
     return rewards
 ```
-
-注意：不要奖励“推理过程很长”。小模型容易学会冗长但错误的 CoT。
-
 ### 20.2 代码 reward
 
 奖励目标：生成代码能通过测试。
@@ -630,12 +622,10 @@ def math_reward(completions, answer, **kwargs):
 建议规则：
 
 ```text
-代码可解析：+0.1
 通过部分测试：0 ~ +1.0
 全部测试通过：+1.0
 运行错误：-0.2
 超时：-0.3
-输出非代码：-0.2
 ```
 
 示例：
@@ -659,185 +649,7 @@ def code_reward(completions, test_cases, **kwargs):
     return rewards
 ```
 
-### 20.3 科研 reward
-
-奖励目标：科学声明判断正确，证据使用合理。
-
-建议规则：
-
-```text
-标签正确：+0.7
-证据选择正确：+0.2
-理由简洁且不矛盾：+0.1
-编造证据：-0.5
-没有给出标签：-0.2
-```
-
-示例：
-
-```python
-def science_reward(completions, label, evidence_ids=None, **kwargs):
-    rewards = []
-    for text, gold_label in zip(completions, label):
-        pred_label = extract_scifact_label(text)
-
-        score = 0.0
-        if pred_label == gold_label:
-            score += 0.7
-
-        if contains_reasoning_cue(text):
-            score += 0.1
-
-        if hallucinated_citation(text):
-            score -= 0.5
-
-        rewards.append(score)
-    return rewards
-```
-
-科研 reward 不建议使用 BLEU / ROUGE 作为主奖励。
-
-更推荐：
-
-```text
-标签是否正确
-证据是否匹配
-是否编造证据
-是否承认信息不足
-```
-
 ---
-
-## 21. GRPO 训练伪代码
-
-```python
-for batch in grpo_loader:
-    prompts = batch["prompt"]
-    expert_id = batch["expert_id"]
-
-    # 1. 对每个 prompt 采样 G 个回答
-    with torch.no_grad():
-        completions, old_logprobs = rollout(
-            model=policy_model,
-            prompts=prompts,
-            expert_id=expert_id,
-            num_generations=4,
-            temperature=0.7,
-            max_new_tokens=256,
-        )
-
-    # 2. reward function 打分
-    rewards = reward_fn(
-        completions=completions,
-        **batch["reward_meta"]
-    )
-
-    # 3. 组内归一化 advantage
-    advantages = group_normalize(rewards, group_size=4)
-
-    # 4. 当前 policy 重新计算 logprob
-    new_logprobs = compute_logprobs(
-        model=policy_model,
-        prompts=prompts,
-        completions=completions,
-        expert_id=expert_id,
-    )
-
-    # 5. reference model 计算 logprob
-    with torch.no_grad():
-        ref_logprobs = compute_logprobs(
-            model=reference_sft_model,
-            prompts=prompts,
-            completions=completions,
-            expert_id=expert_id,
-        )
-
-    # 6. PPO-style clipped objective
-    ratio = torch.exp(new_logprobs - old_logprobs)
-    clipped_ratio = torch.clamp(ratio, 1 - 0.2, 1 + 0.2)
-
-    policy_loss = -torch.min(
-        ratio * advantages,
-        clipped_ratio * advantages
-    ).mean()
-
-    # 7. KL 约束
-    kl_loss = (new_logprobs - ref_logprobs).mean()
-
-    loss = policy_loss + beta_kl * kl_loss
-
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-    optimizer.step()
-```
-
----
-
-## 23. 阶段 3 训练顺序
-
-完整训练顺序如下：
-
-```text
-Step 1：加载 stage2 base checkpoint
-
-Step 2：建立专家映射
-  math    -> expert 0
-  code    -> expert 1
-  science -> expert 2
-
-Step 3：处理 SFT 数据
-  原始数据集
-  -> messages 格式
-  -> 去重
-  -> 长度过滤
-  -> tokenization
-  -> 按 token budget 抽样
-
-Step 4：数学 SFT
-  base_stage2 -> freeze all -> unfreeze expert 0
-  force route expert 0
-  train 1.8M tokens
-  save math_sft.pt
-
-Step 5：代码 SFT
-  base_stage2 -> freeze all -> unfreeze expert 1
-  force route expert 1
-  train 1.8M tokens
-  save code_sft.pt
-
-Step 6：科研 SFT
-  base_stage2 -> freeze all -> unfreeze expert 2
-  force route expert 2
-  train 1.8M tokens
-  save science_sft.pt
-
-Step 7：处理 GRPO prompt pool
-  只保留 prompt + answer/test/evidence
-  不保留 assistant labels
-  确保和 SFT 样本不重叠
-
-Step 8：数学 GRPO
-  policy = math_sft.pt
-  reference = math_sft.pt frozen
-  reward = math_exact
-  save math_grpo.pt
-
-Step 9：代码 GRPO
-  policy = code_sft.pt
-  reference = code_sft.pt frozen
-  reward = unit_test
-  save code_grpo.pt
-
-Step 10：科研 GRPO
-  policy = science_sft.pt
-  reference = science_sft.pt frozen
-  reward = scientific_claim_verification
-  save science_grpo.pt
-```
-
----
-
 ## 26. 阶段 3 评估与验收
 
 ### 26.1 数学专家验收
@@ -896,16 +708,6 @@ pass@1
 是否输出无关解释
 ```
 
-### 26.3 科研专家验收
-
-评估集：
-
-```text
-SciFact validation subset
-PubMedQA validation subset
-自建 claim/evidence 判断数据
-```
-
 指标：
 
 ```text
@@ -914,3 +716,30 @@ evidence match rate
 hallucination rate
 unknown handling rate
 ```
+
+参数配置：
+1. 训练数据参数
+参数	数学专家	代码专家
+train_val_split   90:10   90:10 
+num_generations (G)   4     4
+2. 生成采样参数
+参数	数学专家	代码专家	说明
+temperature 0.7 0.8 代码稍高增加多样性
+max_new_tokens  256 512 代码通常更长
+3. 优化器参数（Muon + AdamW 混合）
+参数	值	说明
+optimizer_type  FFN  
+learning_rate 5e-5  比 SFT 略低，GRPO 更不稳定
+weight_decay  0.01
+lr_scheduler  cosine
+grad_clip_norm  1.0 必须裁剪，GRPO 梯度方差大
+adamw_lr (embed/head) 1e-4
+4. GRPO 算法参数
+参数	值	说明
+kl_coef (β_kl)  0.01  KL 约束系数，防止偏离 SFT 太远
+clip_eps (ε)  0.2 PPO 裁剪范围 [1-ε, 1+ε]
+group_size (G)  4 每组采样回答数
+normalize_advantage True  组内归一化必须开
+5. 训练控制参数
+参数	数学专家	代码专家
+max_seq_len 1024  1024
