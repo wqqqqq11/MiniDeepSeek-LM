@@ -93,56 +93,7 @@ GRPO 数据：
 
 ---
 
-## 7. 阶段 3 数据统一格式
-
-### 7.1 SFT 原始数据格式
-
-SFT 数据统一保存为 JSONL，每行一个样本。
-
-推荐字段：
-
-```json
-{
-  "id": "sample_id",
-  "domain": "math",
-  "expert_id": 0,
-  "sample_type": "task",
-  "source": "UltraData-Math",
-  "messages": [
-    {
-      "role": "system",
-      "content": "你是一个数学推理专家。请给出清晰、严谨的解题过程，并在最后给出答案。"
-    },
-    {
-      "role": "user",
-      "content": "若 x + y = 10，xy = 21，求 x^2 + y^2。"
-    },
-    {
-      "role": "assistant",
-      "content": "由公式 x^2 + y^2 = (x + y)^2 - 2xy，可得 x^2 + y^2 = 100 - 42 = 58。因此答案是 58。"
-    }
-  ],
-  "token_count": 87
-}
-```
-
-### 7.2 SFT 字段解释
-
-| 字段            | 说明                                                               |
-| ------------- | ---------------------------------------------------------------- |
-| id            | 样本唯一 ID                                                          |
-| stage         | 固定为 stage3_sft                                                   |
-| domain        | math / code / science                                            |
-| expert_id     | math=0，code=1，science=2                                          |
-| dialogue_type | single_turn / multi_turn                                         |
-| sample_type   | task / multi_turn_task / domain_identity / boundary / correction |
-| source        | 原始数据集名称                                                          |
-| messages      | ChatML 风格对话数据                                                    |
-| token_count   | tokenizer 后的 token 数                                             |
-
----
-
-## 8. SFT 数据示例
+## 8. SFT 数据示例（ChatML）
 
 ```json
 {
@@ -169,10 +120,20 @@ SFT 数据统一保存为 JSONL，每行一个样本。
 }
 ```
 ---
+9. chat template（chatML）
+<|im_start|>system
+你是一个数学推理专家。请给出清晰的解题过程，并在最后给出答案。
+<|im_end|>
+<|im_start|>user
+若 x + y = 10，xy = 21，求 x^2 + y^2。
+<|im_end|>
+<|im_start|>assistant
+由公式 x^2 + y^2 = (x + y)^2 - 2xy，可得 x^2 + y^2 = 100 - 42 = 58。因此答案是 58。
+<|im_end|>
 
-## 11. SFT tokenized 后的数据格式
 
-原始 JSONL 不能直接用于模型训练，需要经过 tokenizer 和 chat template 处理。
+## 10. SFT tokenized 后的数据格式
+
 
 tokenized 后建议格式：
 
@@ -195,56 +156,6 @@ assistant 部分：labels = 正常 token id
 ```
 
 也就是说，只让模型学习 assistant 的回答，不让模型学习复读 system 和 user prompt。
-
----
-
-## 12. SFT 数据处理流程
-
-每个领域的数据处理流程：
-
-```text
-原始数据集
-→ 字段清洗
-→ 转成 messages 格式
-→ 标记 domain / expert_id / dialogue_type / sample_type
-→ 去重
-→ 过滤过短和过长样本
-→ tokenization
-→ 统计 token_count
-→ 按目标 token budget 抽样
-→ 切分 train / valid
-→ 保存 JSONL 和 tokenized dataset
-```
-
-### 12.1 推荐过滤规则
-
-通用过滤：
-
-```text
-去掉空 prompt
-去掉空 answer
-去掉乱码比例过高的样本
-去掉重复样本
-去掉长度超过 max_seq_len 的样本，或进行截断
-去掉明显包含广告、HTML 垃圾、异常字符的样本
-```
-
-数学过滤：
-
-```text
-保留有明确题目和解答的样本
-优先保留包含最终答案的样本
-去掉只有答案没有过程的低质量样本，除非作为少量 short-answer 数据
-```
-
-代码过滤：
-
-```text
-保留 instruction + code answer
-去掉代码块无法解析且内容明显残缺的样本
-去掉过长代码文件型样本
-尽量保留函数级、算法题级、调试级样本
-```
 
 ---
 
@@ -382,21 +293,11 @@ print(reward)  # 输出: 1.0 (全部通过)
 
 ---
 
-## 15. 是否需要 LoRA
-
-阶段 3 正式训练不建议默认使用 LoRA。
-
-原因：
-
-1. 本项目模型规模约 5M 参数，直接训练专家 FFN 成本很低。
-2. 阶段 3 的目标是训练 MoE expert 本体，不是给模型外挂 adapter。
-3. 直接训练 expert 权重更利于阶段 4 的 OPD 蒸馏合并。
-4. LoRA 会增加权重合并和后续专家路径蒸馏的复杂度。
+## 15. 训练方案
 
 推荐方案：
 
 ```text
-不用 LoRA。
 冻结主干。
 冻结 gate。
 冻结 shared expert。
@@ -428,69 +329,8 @@ shared expert 保持冻结。
 3. 保持其他专家不被污染。
 4. 阶段 4 再通过 OPD 学习统一路由和路径融合。
 
-建议在 MoE forward 中加入：
-
-```python
-def forward(self, x, force_expert_id: int | None = None):
-    if force_expert_id is not None:
-        expert_out = self.experts[force_expert_id](x)
-        shared_out = self.shared_experts(x)
-        return expert_out + shared_out
-
-    # 正常 hash route 或 learned gate route
-    ...
-```
-
 如果 shared expert 已冻结，可以正常参与前向，但不更新参数。
 
-训练调用：
-
-```python
-# 数学
-model(input_ids, labels=labels, force_expert_id=0)
-
-# 代码
-model(input_ids, labels=labels, force_expert_id=1)
-```
-
----
-
-## 17. 参数冻结策略
-
-阶段 3 每次只训练一个专家。
-
-示例：
-
-```python
-def freeze_all(model):
-    for name, p in model.named_parameters():
-        p.requires_grad = False
-
-
-def unfreeze_domain_expert(model, expert_id: int):
-    for layer in model.layers:
-        expert = layer.moe.experts[expert_id]
-        for p in expert.parameters():
-            p.requires_grad = True
-```
-
-训练数学专家：
-
-```python
-model = load_checkpoint("checkpoints/stage2/base.pt")
-freeze_all(model)
-unfreeze_domain_expert(model, expert_id=0)
-```
-
-训练代码专家：
-
-```python
-model = load_checkpoint("checkpoints/stage2/base.pt")
-freeze_all(model)
-unfreeze_domain_expert(model, expert_id=1)
-```
-
-注意：每个领域都应该从同一个 stage2 base checkpoint 开始，而不是串行训练。
 
 ## 18. SFT 训练流程
 
@@ -591,30 +431,6 @@ reference_model = 该领域 SFT 后的冻结模型
 输出过长：-0.05 ~ -0.2
 ```
 
-示例：
-
-```python
-def math_reward(completions, answer, **kwargs):
-    rewards = []
-    for text, gold in zip(completions, answer):
-        pred = extract_final_answer(text)
-
-        score = 0.0
-        if pred is not None and normalize_math(pred) == normalize_math(gold):
-            score += 1.0
-
-        if "答案" in text or "\\boxed" in text:
-            score += 0.1
-
-        if pred is None:
-            score -= 0.2
-
-        if len(text) > 1200:
-            score -= 0.1
-
-        rewards.append(score)
-    return rewards
-```
 ### 20.2 代码 reward
 
 奖励目标：生成代码能通过测试。
@@ -628,105 +444,17 @@ def math_reward(completions, answer, **kwargs):
 超时：-0.3
 ```
 
-示例：
-
-```python
-def code_reward(completions, test_cases, **kwargs):
-    rewards = []
-    for code, tests in zip(completions, test_cases):
-        score = 0.0
-
-        if is_valid_python(code):
-            score += 0.1
-
-        passed, total = run_unit_tests_safely(code, tests)
-        score += passed / max(total, 1)
-
-        if has_timeout_or_runtime_error(code, tests):
-            score -= 0.3
-
-        rewards.append(score)
-    return rewards
-```
-
 ---
-## 26. 阶段 3 评估与验收
-
-### 26.1 数学专家验收
-
-评估集：
-
-```text
-GSM8K validation subset
-自建 100 ~ 300 条数学题
-```
-
-指标：
-
-```text
-exact match
-最终答案提取成功率
-平均输出长度
-格式合规率
-```
-
-重点检查：
-
-```text
-是否能给出最终答案
-是否出现废话式长推理
-是否经常算错简单算术
-是否能解释步骤
-```
-
-### 26.2 代码专家验收
-
-评估集：
-
-```text
-APPS validation subset
-HumanEval 风格小集合
-自建函数题
-```
-
-指标：
-
-```text
-pass@1
-语法错误率
-运行错误率
-超时率
-平均输出长度
-```
-
-重点检查：
-
-```text
-是否输出完整代码
-是否能通过基础测试
-是否经常漏掉边界条件
-是否输出无关解释
-```
-
-指标：
-
-```text
-label accuracy
-evidence match rate
-hallucination rate
-unknown handling rate
-```
-
 参数配置：
 1. 训练数据参数
 参数	数学专家	代码专家
-train_val_split   90:10   90:10 
-num_generations (G)   4     4
+train_val_split   9:1   9:1
+num_generations   4     4
 2. 生成采样参数
 参数	数学专家	代码专家	说明
 temperature 0.7 0.8 代码稍高增加多样性
 max_new_tokens  256 512 代码通常更长
-3. 优化器参数（Muon + AdamW 混合）
+3. 优化器参数（AdamW）
 参数	值	说明
 optimizer_type  FFN  
 learning_rate 5e-5  比 SFT 略低，GRPO 更不稳定
